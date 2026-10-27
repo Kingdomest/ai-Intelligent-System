@@ -1,17 +1,167 @@
-# ai-Intelligent System
+# ai-Intelligent System（贾维斯）
 
-基于 TypeScript、Fastify 和 React 的本地 Agent 应用，包含任务规划、工具调用、权限管理、会话记录和网页界面。
+一个以本地运行为主的智能体工作台。用户通过网页会话描述目标，系统根据任务选择模型调用和工具操作，并把执行状态、授权决定、测试结果与模型调用记录保存在本地，方便继续对话和排查问题。
+
+项目使用 **TypeScript + Fastify + React**。默认示例连接本机 Ollama，也支持通过兼容 OpenAI Chat Completions 的接口接入其他模型。当前仓库主要面向本地开发与实验；涉及文件、网络和进程操作时，请先了解下文的权限模式。
+
+## 界面预览
+
+### 会话工作台
+
+左侧可以新建、搜索、切换和管理会话；中间是对话与任务进度区域，顶部可打开日志、调用轨迹、上下文压缩和通知功能。
+
+![贾维斯会话工作台](docs/images/chat-workspace.png)
+
+### 会话文本日志
+
+按会话汇总任务事件、模型调用和工具操作，支持搜索、按级别筛选，以及复制或下载文本日志。日志用于定位失败阶段和关联请求，不代表任务已经成功完成。
+
+![会话文本日志页面](docs/images/session-text-log.png)
+
+### 调用轨迹
+
+按时间查看模型请求、工具操作和任务事件；页面展示调用次数、输入输出 token 等汇总信息，点击记录可检查对应的执行细节。
+
+![调用轨迹页面](docs/images/execution-trace.png)
+
+## 主要功能
+
+| 功能 | 当前实现 |
+| --- | --- |
+| 多会话对话 | 创建和继续会话，在界面中搜索、重命名、置顶与删除会话；会话 API 另支持归档，并保留历史消息与上下文用量。 |
+| 任务执行 | 根据目标规划步骤，调用实施与评估智能体；记录任务状态，并在需要时请求补充信息、测试或纠错。 |
+| 工具能力 | 内置文件读写、文本处理、JSON 格式化、网络请求、进程操作等有边界的工具；生成的临时工具按任务隔离。 |
+| 权限控制 | 对文件写入、联网、进程和位置等操作按任务权限模式判断，必要时在界面等待用户批准。 |
+| 可观测性 | 记录任务事件、模型调用、工具操作与测试报告；提供调用轨迹和可复制、可下载的会话文本日志。 |
+| 公开资料检索 | 新闻问题可通过 Google News RSS 检索标题和来源；配置 Brave Search API Key 后，规划或文件实现阶段可检索一般公开资料。 |
+| 演示文稿 | 提供演示文稿草稿与 `.pptx` 生成能力，生成文件需通过相应的文件写入权限检查。 |
+
+这些功能依赖模型输出、工具结果和权限决定。任务可能完成、失败、阻塞，或等待用户输入；界面中的状态和测试证据应作为判断依据。
+
+## 工作流程与代码结构
+
+对需要操作的任务，典型流程是：
+
+1. 网页通过 Fastify API 提交消息和附件，创建或继续一个会话中的任务。
+2. 规划器判断目标与所需能力；运行时优先使用已有内置工具，必要时生成仅对当前任务可用的临时工具。
+3. 工具操作先经过权限策略；需要批准时任务暂停，收到用户决定后继续。
+4. 执行过程可经过隔离测试、本机验证和评估；失败时按纠错流程重试或明确结束。
+5. 会话、任务、事件、模型调用和操作记录保存在 SQLite 中，网页从 API 读取聊天记录、日志和轨迹。
+
+| 路径 | 用途 |
+| --- | --- |
+| `src/api/` | Fastify 路由、健康检查、任务与会话接口。 |
+| `src/runtime/` | AgentLoop、任务状态、调度、会话记忆、日志及轨迹事件处理。 |
+| `src/agents/` | 规划、实施、评估和内部智能体协作。 |
+| `src/capabilities/` | 内置工具目录、临时工具注册及沙箱执行。 |
+| `src/permissions/` | 权限策略、批准流程和主机操作。 |
+| `src/model/` | Ollama、兼容 OpenAI 接口的模型提供者与调用记录。 |
+| `src/storage/` | SQLite 持久化。 |
+| `src/research/` | 公开网页搜索与新闻 RSS 处理。 |
+| `src/presentations/` | 演示文稿草稿、规划与渲染。 |
+| `web/src/` | React 会话界面、日志、轨迹和任务状态组件。 |
+| `tests/` | 单元与集成测试。 |
+
+`src/agents/a2a-protocol.ts` 和 `src/api/a2a-routes.ts` 还包含项目内部的智能体协作接口；其 `a2a-local-v1` 协议不声明与官方 Agent2Agent 标准互通。
+
+### 主要 API
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/health` | 检查后端是否启动。 |
+| `POST /api/sessions`、`GET /api/sessions` | 创建和列出会话。 |
+| `GET /api/sessions/:sessionId/messages` | 分页读取会话消息。 |
+| `POST /api/tasks`、`GET /api/tasks/:taskId` | 提交任务并读取状态、事件与结果。 |
+| `POST /api/tasks/:taskId/input` | 补充任务要求的信息。 |
+| `POST /api/tasks/:taskId/approval` | 对等待中的操作给出批准或拒绝决定。 |
+| `GET /api/sessions/:sessionId/trajectory` | 读取会话调用轨迹。 |
+| `GET /api/sessions/:sessionId/logs` | 生成会话文本日志。 |
 
 ## 本地运行
 
-需要 Node.js 24 或更高版本。
+### 环境要求
 
-```bash
+- Node.js **24 或更高版本**，以及随 Node 安装的 npm。
+- 已运行的模型服务：默认配置使用本机 Ollama；也可以改为兼容 OpenAI Chat Completions 的服务。
+- 桌面观察等本机操作与 Windows 环境相关；在其他系统上使用这类能力前需自行验证。
+
+以下命令以 **PowerShell** 为例，在仓库根目录执行：
+
+```powershell
 npm ci
-cp .env.example .env
+Copy-Item .env.example .env
+```
+
+打开 `.env`，把 `MODEL_NAME` 改为本机实际可用的 Ollama 模型名称，并按需调整连接地址。然后分别启动后端和网页开发服务器：
+
+```powershell
+# 终端 1：Fastify API，默认 http://127.0.0.1:3000
 npm run dev
 ```
 
-另开一个终端运行 `npm run dev:web`，打开 Vite 提示的本地地址。运行 `npm run build` 构建服务端与网页。
+```powershell
+# 终端 2：Vite 网页，默认 http://127.0.0.1:5173
+npm run dev:web
+```
 
-模型配置放在本地 `.env` 中。使用兼容 OpenAI 接口的模型时，设置 `MODEL_MODE=openai`、`MODEL_BASE_URL`、`MODEL_NAME` 和 `MODEL_API_KEY`；使用 Ollama 时沿用 `.env.example` 中的设置。`.env` 及其本地变体、数据库和日志均已加入 `.gitignore`，请勿将真实 API Key 写入源码或提交记录。
+浏览器打开 `http://127.0.0.1:5173`。Vite 会把 `/api` 请求代理到本机 3000 端口；后端健康检查为 `http://127.0.0.1:3000/api/health`。
+
+进入网页后，可以先新建会话并提出一个小任务，例如“统计这段文本的行数”。涉及工作区文件、联网或启动进程的请求会按当前权限模式处理；任务结束后可从顶部的“日志”和“轨迹”查看实际步骤与失败原因。
+
+### 模型与环境变量
+
+`.env.example` 是可提交的示例文件；个人设置和真实 API Key 应只写在本机 `.env` 中。
+
+| 变量 | 作用 |
+| --- | --- |
+| `MODEL_MODE` | `ollama`（默认示例）、`openai`（兼容接口）或 `mock`（开发/测试）。 |
+| `MODEL_BASE_URL` | 模型服务基地址。Ollama 示例为 `http://127.0.0.1:11434`；兼容 OpenAI 的服务应填写其 API 基地址，通常包含 `/v1`，程序会追加 `/chat/completions`。 |
+| `MODEL_NAME` | 实际可用的模型 ID；示例值不保证每台机器都已安装。 |
+| `MODEL_API_KEY` | 兼容 OpenAI 接口的访问密钥；Ollama 模式不使用此密钥。 |
+| `MODEL_REQUEST_TIMEOUT_MS` | 单次模型请求超时，允许 30000～600000 毫秒。 |
+| `BRAVE_SEARCH_API_KEY` | 可选，启用规划和文件实现阶段的一般公开资料搜索。 |
+| `JARVIS_DATA_DIR` | 本地 SQLite 数据目录，示例为 `./data`。 |
+| `JARVIS_WORKSPACE_ROOT` | 任务的工作区根目录，影响文件权限边界；示例为当前目录。 |
+| `HOST` / `PORT` | 后端监听地址与端口，示例为 `127.0.0.1:3000`。 |
+
+例如接入兼容 OpenAI 的服务时，把本地 `.env` 中相关项改为：
+
+```dotenv
+MODEL_MODE=openai
+MODEL_BASE_URL=https://your-provider.example/v1
+MODEL_NAME=your-model-id
+MODEL_API_KEY=your-local-secret
+```
+
+上面的地址、模型名和密钥均为占位符；请使用实际服务提供的信息。不要把修改后的 `.env` 或真实密钥复制到 README、截图、Issue 或提交记录中。
+
+### 权限模式
+
+创建任务时可以选择以下模式，默认是“请求批准”：
+
+| 模式 | 执行边界 |
+| --- | --- |
+| 请求批准 | 工作区内读取可直接进行；写入、联网、位置和进程等操作逐项请求批准。 |
+| 帮我批准 | 工作区内低风险的新建操作，以及不携带任务数据的公开 HTTPS GET 等可自动进行；覆盖、删除和更高风险操作仍需批准。 |
+| 完全访问权限 | 策略支持的文件、网络和进程操作可直接进行；仅用于信任当前任务与运行环境时。 |
+
+实际决定还取决于操作类型、目标路径和上下文。权限弹窗显示的是待执行操作，批准前请核对目标与参数。
+
+### 常用命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `npm run dev` | 以监听模式启动后端。 |
+| `npm run dev:web` | 启动 Vite 网页开发服务器。 |
+| `npm run typecheck` | 检查 TypeScript 类型。 |
+| `npm test -- --run` | 运行 Vitest 测试并退出。 |
+| `npm run build` | 执行 TypeScript 检查并构建网页到 `web/dist/`；当前脚本不单独打包后端。 |
+
+## 数据、日志与安全
+
+- 默认运行数据保存在 `data/jarvis.sqlite`。其中可能包含会话消息、任务内容和模型调用记录；`data/` 已被 Git 忽略，不会随正常提交上传。
+- `.env*`、日志、构建产物和本地候选副本也已被忽略，只有不含真实密钥的 `.env.example` 会提交。
+- 截图展示的是实际界面，包含可见的会话标题、日志片段和本机路径。若以后将仓库改为公开，请先复查截图和文档内容。
+- 默认后端仅监听 `127.0.0.1`。项目面向本地使用，请勿在没有额外身份验证和网络隔离的情况下直接向公网开放。
+
+更多实现背景可参阅 [`docs/`](docs/) 中的设计说明与网络资料搜索说明。
