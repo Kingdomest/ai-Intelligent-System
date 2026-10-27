@@ -1,0 +1,10 @@
+node_modules/
+dist/
+web/dist/
+.env*
+!.env.example
+data/
+.superpowers/
+.candidate-2026-09-24-self-repair/
+/*.pptx
+*.log
