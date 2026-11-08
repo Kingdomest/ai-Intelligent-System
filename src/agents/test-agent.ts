@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { CapabilityPermission } from '../domain/contracts.js';
 import { ModelGateway } from '../model/gateway.js';
 
-const permissionSchema = z.enum(['filesystem.read', 'filesystem.write', 'network', 'location', 'process']);
+const permissionSchema = z.enum(['filesystem.read', 'filesystem.write', 'network', 'location', 'process', 'mcp']);
 const outputEquals = z.strictObject({ type: z.literal('output_equals'), path: z.string().max(120), value: z.json() });
 const outputContains = z.strictObject({ type: z.literal('output_contains'), path: z.string().max(120), text: z.string().max(500) });
 const hostCall = z.strictObject({
@@ -95,6 +95,7 @@ export class TestAgent {
 
   async generate(taskId: string, context: {
     name: string; permissions: CapabilityPermission[]; executionInput: Record<string, unknown>; acceptanceCriteria: string[];
+    inputSchema?: unknown; outputSchema?: unknown;
   }): Promise<TestPlan> {
     if (context.name === 'text.count_lines') {
       return parseTestPlan({ cases: [
@@ -245,6 +246,17 @@ export class TestAgent {
           assertions: [call, { type: 'execution_error' }] },
       ] }, context.permissions);
     }
+    if (context.name === 'mcp.call') {
+      const server = context.executionInput.server;
+      const tool = context.executionInput.tool;
+      if (typeof server !== 'string' || typeof tool !== 'string') throw new Error('MCP call test requires server and tool.');
+      const call = { type: 'host_call', permission: 'mcp', action: 'call', target: `${server}/${tool}` } as const;
+      return parseTestPlan({ cases: [
+        { id: 'mcp-call', mode: 'sandbox', hostBehavior: 'success', assertions: [call] },
+        { id: 'mcp-host-failure', mode: 'sandbox', hostBehavior: 'failure',
+          assertions: [call, { type: 'execution_error' }] },
+      ] }, context.permissions);
+    }
     if (context.name === 'presentation.create') {
       const target = context.executionInput.path;
       if (typeof target !== 'string' || !/\.pptx$/i.test(target)) throw new Error('Presentation test requires a .pptx target.');
@@ -264,7 +276,7 @@ export class TestAgent {
     }
     const response = await this.gateway.complete({
       role: 'tester.plan', taskId,
-      system: 'You are the independent Jarvis test agent. Return only declarative test cases, never scripts or commands to run. Use at most 10 cases. Sandbox cases may supply input data and bounded output/host-call assertions; use execution_error and no_host_call to verify rejected missing input. Add process/window/foreground live desktop assertions for process.launch, not for short process.run unless it explicitly launches an application. Cover normal, missing or boundary input and host failure when relevant. Do not assert a simulated host result proves real integration.',
+      system: 'You are the independent Jarvis test agent. Return only declarative test cases, never scripts or commands to run. For generated tools use at most 3 cases: the actual input, one distinct valid input, and one boundary input if useful. Each distinct or boundary case MUST set its own input. Assertions must follow the supplied outputSchema exactly; nested properties need their full path, e.g. frequencies.apple. Paths use plain dot notation, with an empty string for the whole output: never use $ or $. prefixes. Do not assert a missing-input error unless the tool contract requires one. Sandbox cases may supply input data and bounded output/host-call assertions; use execution_error and no_host_call to verify rejected missing input. Add process/window/foreground live desktop assertions for process.launch, not for short process.run unless it explicitly launches an application. Cover host failure when relevant. Do not assert a simulated host result proves real integration.',
       user: JSON.stringify({ ...context, executionInput: summarizeInput(context.executionInput) }),
     }, testPlanSchema);
     return parseTestPlan(response.data, context.permissions);

@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { CapabilityPermission, OperationJournalRecord } from '../domain/contracts.js';
 import type { HostCall, HostCallResult } from '../permissions/operation-protocol.js';
@@ -9,6 +9,7 @@ import { WindowsDesktopObserver } from './windows-desktop-observer.js';
 import { canonicalizeFilesystemPath } from '../permissions/policy.js';
 import { isShellGuiLaunch } from '../permissions/process-contract.js';
 import { presentationInputSchema, verifyPresentationFile } from '../presentations/render.js';
+import { routineGitClone } from './git-clone-contract.js';
 
 export class TestExecutor {
   constructor(private readonly sandbox: SandboxRunner) {}
@@ -70,8 +71,22 @@ export class TestExecutor {
           codes.push('PROCESS_EXIT_FAILED');
         }
       }
+      if (result?.ok === true && operation.operation.permission === 'mcp') {
+        const value = result.value && typeof result.value === 'object' ? result.value as Record<string, unknown> : {};
+        const { server, tool } = operation.operation.arguments;
+        if (value.server !== server || value.tool !== tool || !Array.isArray(value.content)) {
+          codes.push('MCP_RESULT_INVALID');
+        }
+      }
       cases.push(liveResult('host-operation', codes.length
         ? targetMissing && codes.length === 1 ? 'blocked' : 'failed' : 'passed', codes));
+      if (operation.operation.permission === 'process' && operation.operation.action === 'run'
+        && result?.ok === true && (result.value as { exitCode?: unknown } | undefined)?.exitCode === 0
+        && routineGitClone(operation.operation.arguments)) {
+        const checkoutConfirmed = await verifyGitCloneEffect(operation.operation.arguments);
+        cases.push(liveResult('git-checkout', checkoutConfirmed ? 'passed' : 'failed',
+          checkoutConfirmed ? [] : ['GIT_CHECKOUT_MISSING']));
+      }
     }
 
     if (operations.some((item) => item.operation.permission === 'process'
@@ -168,6 +183,20 @@ export class TestExecutor {
   }
 }
 
+async function verifyGitCloneEffect(arguments_: Record<string, unknown>): Promise<boolean> {
+  const clone = routineGitClone(arguments_);
+  if (!clone) return false;
+  try {
+    const marker = await stat(path.join(clone.directory, '.git'));
+    if (!marker.isDirectory()) return false;
+    const config = await readFile(path.join(clone.directory, '.git', 'config'), 'utf8');
+    const origin = config.match(/\[remote "origin"\]([^\[]*)/i)?.[1]
+      ?.match(/^\s*url\s*=\s*(.+)\s*$/m)?.[1]?.trim();
+    if (origin !== clone.remote) return false;
+    return (await readdir(clone.directory)).some(name => name !== '.git');
+  } catch { return false; }
+}
+
 function sameTarget(actual: string, expected: string): boolean {
   try {
     const windows = process.platform === 'win32' || path.win32.isAbsolute(actual) || path.win32.isAbsolute(expected);
@@ -201,7 +230,8 @@ function liveResult(id: string, status: TestCaseResult['status'], codes: string[
   return { id, mode: 'live_observation', status, codes,
     evidence: status === 'passed'
       ? [{ kind: id === 'desktop' ? 'desktop' : 'journal',
-        code: id === 'desktop' ? 'FOREGROUND_WINDOW_CONFIRMED' : 'AUTHORIZED_OPERATION_COMPLETED' }]
+        code: id === 'desktop' ? 'FOREGROUND_WINDOW_CONFIRMED'
+          : id === 'git-checkout' ? 'GIT_CHECKOUT_CONFIRMED' : 'AUTHORIZED_OPERATION_COMPLETED' }]
       : codes.map((code) => ({ kind: 'assertion', code })) };
 }
 
@@ -278,6 +308,10 @@ function validateCall(call: HostCall): string | undefined {
     && (typeof call.arguments.path !== 'string' || !call.arguments.path.trim())) return 'INVALID_HOST_CALL';
   if (call.action === 'createPresentation' && !presentationInputSchema.safeParse(call.arguments).success) return 'INVALID_PRESENTATION';
   if (call.permission === 'network' && !/^https?:\/\//i.test(call.target)) return 'INVALID_HOST_CALL';
+  if (call.permission === 'mcp' && (call.action !== 'call' || typeof call.arguments.server !== 'string'
+    || typeof call.arguments.tool !== 'string' || call.target !== `${call.arguments.server}/${call.arguments.tool}`
+    || !call.arguments.arguments || typeof call.arguments.arguments !== 'object'
+    || Array.isArray(call.arguments.arguments))) return 'INVALID_HOST_CALL';
   return undefined;
 }
 
@@ -296,12 +330,15 @@ function simulatedSuccess(call: HostCall): HostCallResult {
     value: call.action === 'launch' ? { started: true, pid: 1234 } : { exitCode: 0, stdout: '', stderr: '' } };
   if (call.permission === 'network') return { callId: call.callId, ok: true, value: { status: 200, body: '' } };
   if (call.permission === 'location') return { callId: call.callId, ok: true, value: { supported: false, reason: 'No provider configured.' } };
+  if (call.permission === 'mcp') return { callId: call.callId, ok: true, value: { server: call.arguments.server,
+    tool: call.arguments.tool, content: [{ type: 'text', text: '[simulated MCP result]' }] } };
   return failed(call, 'INVALID_HOST_CALL');
 }
 
 function readPath(value: unknown, path: string): unknown {
-  if (!path) return value;
-  return path.split('.').reduce<unknown>((current, key) => current && typeof current === 'object'
+  const normalized = path === '$' ? '' : path.startsWith('$.') ? path.slice(2) : path;
+  if (!normalized) return value;
+  return normalized.split('.').reduce<unknown>((current, key) => current && typeof current === 'object'
     ? (current as Record<string, unknown>)[key] : undefined, value);
 }
 

@@ -21,6 +21,7 @@ import { TaskService } from '../../src/runtime/task-service.js';
 import { SqliteStore } from '../../src/storage/sqlite-store.js';
 import { DefaultHostOperationExecutor } from '../../src/permissions/host-operations.js';
 import { ApprovalRequiredError, PermissionBroker } from '../../src/permissions/permission-broker.js';
+import { ToolDiscovery } from '../../src/capabilities/tool-discovery.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -114,6 +115,81 @@ afterEach(() => {
 });
 
 describe('task API', () => {
+  it('returns a metadata-only task flow with worker progress and peer exchange', async () => {
+    const { services, store } = createApi();
+    const task = store.createTask({ message: '整理报告', attachments: [] });
+    const root = store.createAgent({ rootTaskId: task.id, name: '主 Agent', role: 'orchestrator', goal: '统筹' });
+    const workerA = store.createAgent({ rootTaskId: task.id, parentAgentId: root.id,
+      name: '子 Agent A', role: 'task-worker-0', goal: '执行' });
+    const workerB = store.createAgent({ rootTaskId: task.id, parentAgentId: root.id,
+      name: '子 Agent B', role: 'task-worker-1', goal: '执行' });
+    const version = 'abcdef0123456789';
+    store.sendAgentMessage({ messageId: `${task.id}:assign:${version}:read:${workerA.id}`,
+      rootTaskId: task.id, senderAgentId: root.id, recipientAgentId: workerA.id, type: 'request',
+      payload: { kind: 'step.assignment', stepId: 'read', contract: { objective: '读取资料',
+        capabilityKey: 'filesystem.read_text', dependsOn: [] } } });
+    store.sendAgentMessage({ messageId: `${task.id}:assign:${version}:write:${workerB.id}`,
+      rootTaskId: task.id, senderAgentId: root.id, recipientAgentId: workerB.id, type: 'request',
+      payload: { kind: 'step.assignment', stepId: 'write', description: '撰写报告',
+        capabilityKey: 'filesystem.write_text', dependsOn: ['read'] } });
+    store.sendAgentMessage({ rootTaskId: task.id, senderAgentId: workerB.id, recipientAgentId: workerA.id,
+      type: 'request', payload: { kind: 'dependency.request', stepId: 'write', dependencyStepId: 'read' } });
+    store.sendAgentMessage({ rootTaskId: task.id, senderAgentId: workerA.id, recipientAgentId: workerB.id,
+      type: 'response', payload: { kind: 'dependency.result', dependencyStepId: 'read', output: 'PRIVATE_TOOL_OUTPUT' } });
+    store.appendEvent(task.id, { type: 'team.dispatched', payload: { planVersion: version, assignedSteps: 2 } });
+    store.appendEvent(task.id, { type: 'step.completed', payload: { stepId: 'read' } });
+    store.appendEvent(task.id, { type: 'agent.step_active', payload: { stepId: 'write' } });
+    const app = await buildApp({ registerRoutes: instance => registerRoutes(instance, services) });
+    const response = await app.inject({ method: 'GET', url: `/api/tasks/${task.id}/flow` });
+    expect(response.statusCode).toBe(200);
+    expect(response.body).not.toContain('PRIVATE_TOOL_OUTPUT');
+    expect(response.json()).toMatchObject({ taskId: task.id, activeStepId: 'write',
+      progress: { completed: 1, total: 2 }, steps: [
+        { id: 'read', description: '读取资料', status: 'completed', ownerAgentId: workerA.id },
+        { id: 'write', status: 'running', ownerAgentId: workerB.id, dependsOn: ['read'] },
+      ] });
+    expect(response.json().exchanges.some((item: { kind: string }) => item.kind === 'response')).toBe(true);
+    const revisedVersion = '1234567890abcdef';
+    store.sendAgentMessage({ messageId: `${task.id}:assign:${revisedVersion}:revise:${workerA.id}`,
+      rootTaskId: task.id, senderAgentId: root.id, recipientAgentId: workerA.id, type: 'request',
+      payload: { kind: 'step.assignment', stepId: 'revise', description: '调整报告',
+        capabilityKey: 'filesystem.write_text', dependsOn: [] } });
+    store.appendEvent(task.id, { type: 'plan.revised', payload: { stepId: 'write' } });
+    store.appendEvent(task.id, { type: 'team.dispatched', payload: { planVersion: revisedVersion, assignedSteps: 1 } });
+    const revised = (await app.inject({ method: 'GET', url: `/api/tasks/${task.id}/flow` })).json();
+    expect(revised.steps.map((step: { id: string }) => step.id)).toEqual(['revise']);
+    expect(revised.replacedSteps.map((step: { id: string }) => step.id)).toEqual(['read', 'write']);
+    expect(revised.progress).toMatchObject({ completed: 0, total: 1, revisionCount: 1 });
+    task.status = 'BLOCKED';
+    store.saveTask(task);
+    const blocked = (await app.inject({ method: 'GET', url: `/api/tasks/${task.id}/flow` })).json();
+    expect(blocked.steps[0].status).toBe('blocked');
+    expect((await app.inject({ method: 'GET', url: '/api/tasks/missing/flow' })).statusCode).toBe(404);
+    await app.close();
+    store.close();
+  });
+
+  it('lists tools and searches current MCP tool schemas through the API', async () => {
+    const { services, store } = createApi();
+    services.toolDiscovery = new ToolDiscovery({ listTools: async () => [{
+      server: 'filesystem', name: 'search_files', description: 'Search files by pattern',
+      inputSchema: { type: 'object', required: ['pattern'], properties: { pattern: { type: 'string' } } },
+      readOnly: true,
+    }] });
+    const app = await buildApp({ registerRoutes: instance => registerRoutes(instance, services) });
+    try {
+      const listed = (await app.inject({ method: 'GET', url: '/api/tools' })).json();
+      expect(listed.tools).toContainEqual(expect.objectContaining({ id: 'mcp:filesystem/search_files' }));
+      const result = (await app.inject({ method: 'GET', url: '/api/tools/search?query=search%20files&limit=3' })).json();
+      expect(result.tools[0]).toMatchObject({ id: 'mcp:filesystem/search_files',
+        inputSchema: { required: ['pattern'] } });
+      expect((await app.inject({ method: 'GET', url: '/api/tools/search?query=&limit=3' })).statusCode).toBe(400);
+    } finally {
+      await app.close();
+      store.close();
+    }
+  });
+
   it('stops an in-flight model request, records cancellation, and accepts the next session task', async () => {
     const fallback = new MockModelProvider();
     let signal: AbortSignal | undefined;

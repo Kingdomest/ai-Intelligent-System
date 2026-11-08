@@ -64,8 +64,17 @@ export interface ExecutionCheckpoint {
     outcome: 'success' | 'failure';
     output?: unknown;
     failure?: CorrectionFailure;
+    verification?: StepVerificationEvidence;
     safeToReplay: boolean;
   };
+}
+
+export interface StepVerificationEvidence {
+  mode: 'sandbox' | 'live_observation';
+  passed: number;
+  failed: number;
+  blocked: number;
+  checks: Array<{ id: string; status: 'passed' | 'failed' | 'blocked'; codes: string[] }>;
 }
 
 export type CorrectionTarget = 'answer' | 'plan_or_input' | 'generated_tool';
@@ -185,7 +194,7 @@ export interface CapabilityManifest {
   outputSchema: unknown;
   entrypoint: string;
   runtime: 'node-sandbox-v1';
-  permissions: Array<'filesystem.read' | 'filesystem.write' | 'network' | 'location' | 'process'>;
+  permissions: Array<'filesystem.read' | 'filesystem.write' | 'network' | 'location' | 'process' | 'mcp'>;
   riskLevel: 'low' | 'medium' | 'high';
   tests: string[];
   provenance: { sourceTaskId: string; generatedAt: string; migratedFromActive?: boolean };

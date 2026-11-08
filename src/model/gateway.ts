@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { z, type ZodType } from 'zod';
 
 export interface ModelRequest {
@@ -113,25 +114,30 @@ export class ModelGateway {
     let completion: ModelCompletion | undefined;
     try {
       if (signal.aborted) throw new TaskCancelledError();
-      try {
-        completion = await this.provider.complete(providerRequest);
-      } catch (error) {
-        if (signal.aborted) throw new TaskCancelledError();
-        // Local inference is side-effect-free. Give a timed-out planner one
-        // bounded second attempt before failing the whole task.
-        const retryable = details?.provider === 'ollama' && request.role === 'planner'
-          && error instanceof Error && /Ollama request timed out/i.test(error.message);
-        if (!retryable) throw error;
-        if (traceId) {
-          try { this.trace?.finish(traceId, { error: error.message,
-            errorDetails: { name: error.name } }); } catch { /* Keep recovery available. */ }
+      let retries = 0;
+      for (;;) {
+        try {
+          completion = await this.provider.complete(providerRequest);
+          break;
+        } catch (error) {
+          if (signal.aborted) throw new TaskCancelledError();
+          const allowedRetries = modelRetryAllowance(error);
+          if (retries >= allowedRetries) throw error;
+          if (traceId) {
+            try { this.trace?.finish(traceId, { error: error instanceof Error ? error.message : String(error),
+              errorDetails: modelErrorDetails(error) }); } catch { /* Keep recovery available. */ }
+          }
+          traceId = undefined;
+          retries++;
+          reportActivity('retrying');
+          // Retry only the model request, never the host operation or agent step.
+          const backoffMs = 500 * 2 ** (retries - 1);
+          try { await delay(Math.round(backoffMs * (0.9 + Math.random() * 0.2)), undefined, { signal }); }
+          catch (waitError) { if (signal.aborted) throw new TaskCancelledError(); throw waitError; }
+          if (this.trace && (request.taskId || request.sessionId)) {
+            try { traceId = this.trace.start(providerRequest, details); } catch { /* Keep recovery available. */ }
+          }
         }
-        traceId = undefined;
-        reportActivity('retrying');
-        if (this.trace && (request.taskId || request.sessionId)) {
-          try { traceId = this.trace.start(providerRequest, details); } catch { /* Keep recovery available. */ }
-        }
-        completion = await this.provider.complete(providerRequest);
       }
       if (signal.aborted) throw new TaskCancelledError();
       const data = schema.parse(completion.data);
@@ -143,13 +149,11 @@ export class ModelGateway {
     } catch (error) {
       const cancelled = error instanceof TaskCancelledError || signal.aborted;
       if (traceId) {
-        const details = error && typeof error === 'object'
-          ? error as { name?: unknown; statusCode?: unknown; requestId?: unknown; rawContent?: unknown } : {};
+        const errorData = error && typeof error === 'object'
+          ? error as { rawContent?: unknown } : {};
         try { this.trace?.finish(traceId, { completion, error: error instanceof Error ? error.message : String(error), cancelled,
-          rawResponse: typeof details.rawContent === 'string' ? details.rawContent : undefined,
-          errorDetails: { name: typeof details.name === 'string' ? details.name : 'Error',
-            statusCode: typeof details.statusCode === 'number' ? details.statusCode : undefined,
-            requestId: typeof details.requestId === 'string' ? details.requestId : undefined } }); }
+          rawResponse: typeof errorData.rawContent === 'string' ? errorData.rawContent : undefined,
+          errorDetails: modelErrorDetails(error) }); }
         catch { /* Preserve the original model error. */ }
       }
       reportActivity(cancelled ? 'cancelled' : 'failed');
@@ -162,6 +166,24 @@ export class ModelGateway {
       }
     }
   }
+}
+
+function modelErrorDetails(error: unknown): { name: string; statusCode?: number; requestId?: string } {
+  const value = error && typeof error === 'object'
+    ? error as { name?: unknown; statusCode?: unknown; requestId?: unknown } : {};
+  return { name: typeof value.name === 'string' ? value.name : 'Error',
+    statusCode: typeof value.statusCode === 'number' ? value.statusCode : undefined,
+    requestId: typeof value.requestId === 'string' ? value.requestId : undefined };
+}
+
+function modelRetryAllowance(error: unknown): number {
+  if (!error || typeof error !== 'object') return 0;
+  const value = error as { code?: unknown; statusCode?: unknown };
+  if (value.code === 'TIMEOUT') return 1;
+  if (value.code === 'TRANSPORT') return 2;
+  if (value.statusCode === 408 || value.statusCode === 429
+    || typeof value.statusCode === 'number' && value.statusCode >= 500 && value.statusCode <= 599) return 2;
+  return 0;
 }
 
 export const modelUsageSchema = z.object({

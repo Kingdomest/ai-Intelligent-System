@@ -65,6 +65,39 @@ export function publicTaskEvent(event: TaskEvent): TaskEvent {
       payload.stepId = label(source.stepId);
       payload.remaining = count(source.remaining);
       break;
+    case 'team.dispatched':
+      payload.workerCount = count(source.workerCount);
+      payload.assignedSteps = count(source.assignedSteps);
+      payload.planVersion = label(source.planVersion);
+      payload.stepIds = Array.isArray(source.stepIds) ? source.stepIds.slice(0, 50).map(label).filter(Boolean) : [];
+      break;
+    case 'tool.searched':
+      payload.stepId = label(source.stepId);
+      payload.candidateCount = count(source.candidateCount);
+      payload.queryCount = count(source.queryCount);
+      payload.workerRole = label(source.workerRole);
+      break;
+    case 'tool.selected':
+      payload.stepId = label(source.stepId);
+      payload.choice = label(source.choice);
+      payload.tool = label(source.tool);
+      payload.server = label(source.server);
+      payload.workerRole = label(source.workerRole);
+      payload.reason = label(source.reason);
+      break;
+    case 'agent.step_active':
+      payload.stepId = label(source.stepId);
+      payload.agentId = label(source.agentId);
+      payload.agentName = promptText(source.agentName, 80);
+      payload.description = promptText(source.description, 180);
+      break;
+    case 'agent.peer_exchange':
+      payload.stepId = label(source.stepId);
+      payload.dependencyStepId = label(source.dependencyStepId);
+      break;
+    case 'agent.result_reported':
+      payload.stepId = label(source.stepId);
+      break;
     case 'step.started':
     case 'step.paused':
     case 'step.failed':

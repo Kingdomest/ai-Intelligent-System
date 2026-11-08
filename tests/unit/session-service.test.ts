@@ -170,11 +170,11 @@ describe('SqliteStore session persistence', () => {
     expect(store.hasActiveTaskInSession(session.id)).toBe(false);
   });
 
-  it('migrates the schema to user_version 3 and keeps legacy tasks unassigned', () => {
+  it('migrates the schema to user_version 5 and keeps legacy tasks unassigned', () => {
     const store = createStore();
     const userVersion = (store as unknown as { database: { prepare: (sql: string) => { get: () => { user_version: number } } } })
       .database.prepare('PRAGMA user_version').get().user_version;
-    expect(userVersion).toBe(4);
+    expect(userVersion).toBe(5);
     const legacy = store.createTask({ message: '旧任务', attachments: [] });
     expect(legacy.sessionId).toBeUndefined();
     expect(store.listUnassignedTasks().map(task => task.id)).toContain(legacy.id);

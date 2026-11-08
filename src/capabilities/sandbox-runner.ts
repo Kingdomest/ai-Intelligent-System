@@ -102,6 +102,9 @@ process.on('message', async (message) => {
             request && typeof request === 'object' && !Array.isArray(request) ? request : {},
           ) }),
           location: Object.freeze({ current: () => invoke('location', 'current', 'device location', 'Retrieve the current device location.', {}) }),
+          mcp: Object.freeze({ call: (server, tool, args) => invoke('mcp', 'call', String(server) + '/' + String(tool),
+            'Call the configured MCP tool ' + String(server) + '/' + String(tool) + '.',
+            { server, tool, arguments: args }) }),
         });
         globalThis.host = host;
         globalThis.input = JSON.parse(inputJson);
@@ -127,7 +130,8 @@ export class SandboxRunner {
   async run(code: string, input: unknown, options: SandboxRunOptions = {}): Promise<SandboxResult> {
     const startedAt = Date.now();
     const mode = options.mode ?? 'dry-run';
-    const timeoutMs = options.timeoutMs ?? (mode === 'live' ? 15_000 : 2_000);
+    // Live tools may legitimately wait for the broker's 120-second process limit.
+    const timeoutMs = options.timeoutMs ?? (mode === 'live' ? 150_000 : 2_000);
     // Host reads allow up to 1 MB; JSON escaping can expand their serialized output.
     const maxOutputBytes = options.maxOutputBytes ?? (mode === 'live' ? 8_000_000 : 100_000);
     const directory = await mkdtemp(join(tmpdir(), `jarvis-sandbox-${randomUUID()}-`));
@@ -261,6 +265,16 @@ function defaultDryRun(call: HostCall): HostCallResult {
   const pathValue = typeof args.path === 'string' ? args.path : call.target;
   if (call.permission === 'location') {
     return { callId: call.callId, ok: true, value: { supported: false, reason: 'No location provider is configured.' } };
+  }
+  if (call.permission === 'mcp') {
+    const server = args.server;
+    const tool = args.tool;
+    if (typeof server !== 'string' || typeof tool !== 'string' || call.target !== `${server}/${tool}`
+      || !args.arguments || typeof args.arguments !== 'object' || Array.isArray(args.arguments)) {
+      return { callId: call.callId, ok: false, error: { code: 'INVALID_MCP_REQUEST', message: 'MCP tool call requires a server, tool, and argument object.' } };
+    }
+    return { callId: call.callId, ok: true, value: { server, tool,
+      content: [{ type: 'text', text: '[dry-run MCP result]' }] } };
   }
   if ((call.permission === 'filesystem.read' || call.permission === 'filesystem.write')
     && (typeof pathValue !== 'string' || !pathValue.trim())) {

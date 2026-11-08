@@ -1,4 +1,5 @@
 import type { ToolCandidate } from '../agents/agent-runner.js';
+import type { CapabilityPermission } from '../domain/contracts.js';
 import type { HostCall, HostCallResult } from '../permissions/operation-protocol.js';
 import type { SandboxRunner } from './sandbox-runner.js';
 
@@ -105,7 +106,8 @@ function variantKeys(input: Record<string, unknown>): string[] {
   return [...preferred, ...Object.keys(input).filter((key) => !preferred.includes(key) && !contextFields.has(key)), 'content'];
 }
 
-function validateCall(call: HostCall, permissions: ToolCandidate['permissions']): string | null {
+function validateCall(call: HostCall, permissions: readonly CapabilityPermission[]): string | null {
+  if (call.permission === 'mcp') return 'GENERATED_MCP_CALL_FORBIDDEN';
   if (!permissions.includes(call.permission)) return 'UNDECLARED_PERMISSION';
   if (!call.target?.trim() || !call.arguments || typeof call.arguments !== 'object' || Array.isArray(call.arguments)) return 'INVALID_HOST_CALL';
   if (call.permission === 'filesystem.read' || call.permission === 'filesystem.write') {

@@ -174,4 +174,23 @@ describe('test plan contract', () => {
     });
     expect(request?.user).not.toMatch(/PRIVATE_ATTACHMENT_BODY|PRIVATE_KEY/);
   });
+
+  it('gives generated-tool tests the output contract and accepts nested word-frequency assertions', async () => {
+    let request: ModelRequest | undefined;
+    const agent = new TestAgent(new ModelGateway({ complete: async input => {
+      request = input;
+      return { data: { cases: [{ id: 'frequency', mode: 'sandbox', input: { text: 'apple banana apple' },
+        assertions: [{ type: 'output_equals', path: '$.frequencies.apple', value: 2 },
+          { type: 'output_equals', path: 'totalWords', value: 3 }] }] },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const outputSchema = { type: 'object', properties: { frequencies: { type: 'object' }, totalWords: { type: 'integer' } } };
+    const plan = await agent.generate('frequency-task', { name: 'dynamic.text.word_frequency', permissions: [],
+      executionInput: { text: 'apple banana apple' }, acceptanceCriteria: ['Count every word'], outputSchema });
+    expect(JSON.parse(request!.user).outputSchema).toEqual(outputSchema);
+    const report = await new TestExecutor(new SandboxRunner()).runSandbox(
+      'export async function run(input) { return { frequencies: { apple: 2, banana: 1 }, totalWords: 3 }; }',
+      plan, { text: 'apple banana apple' });
+    expect(report.failed).toBe(0);
+  });
 });

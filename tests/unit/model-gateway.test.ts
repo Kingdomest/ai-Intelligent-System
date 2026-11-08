@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { ModelGateway, type ModelActivityEvent, type ModelProvider } from '../../src/model/gateway.js';
-import { OpenAICompatibleProvider } from '../../src/model/openai-compatible-provider.js';
+import { ModelProviderError, OpenAICompatibleProvider } from '../../src/model/openai-compatible-provider.js';
 
 describe('ModelGateway', () => {
   it('marks a user-stopped model call as cancelled without retrying it', async () => {
@@ -67,7 +67,7 @@ describe('ModelGateway', () => {
     const activities: ModelActivityEvent[] = [];
     const traces: Array<{ id: string; error?: string }> = [];
     let traceSequence = 0;
-    const complete = vi.fn().mockRejectedValueOnce(new Error('Ollama request timed out during planner after 180000ms.'))
+    const complete = vi.fn().mockRejectedValueOnce(Object.assign(new Error('Ollama request timed out during planner after 180000ms.'), { code: 'TIMEOUT' }))
       .mockResolvedValueOnce({ data: { ok: true }, usage: { inputTokens: 1, outputTokens: 1 } });
     const gateway = new ModelGateway({ complete, describeRequest: () => ({ provider: 'ollama' }) },
       { start: () => `trace-${++traceSequence}`, finish: (id, outcome) => { traces.push({ id, error: outcome.error }); } },
@@ -80,12 +80,12 @@ describe('ModelGateway', () => {
       { id: 'trace-2', error: undefined }]);
   });
 
-  it('does not retry external provider failures or an exhausted local retry', async () => {
-    const timeout = new Error('Ollama request timed out during planner after 180000ms.');
-    const external = vi.fn().mockRejectedValue(timeout);
+  it('does not retry a permanent provider failure and bounds a repeated timeout', async () => {
+    const timeout = Object.assign(new Error('Ollama request timed out during planner after 180000ms.'), { code: 'TIMEOUT' });
+    const external = vi.fn().mockRejectedValue(new ModelProviderError('Unauthorized', 401));
     await expect(new ModelGateway({ complete: external, describeRequest: () => ({ provider: 'openai-compatible' }) })
       .complete({ taskId: 'task-1', role: 'planner', system: '', user: '' }, z.object({ ok: z.boolean() })))
-      .rejects.toThrow('timed out');
+      .rejects.toThrow('Unauthorized');
     expect(external).toHaveBeenCalledTimes(1);
     const local = vi.fn().mockRejectedValue(timeout);
     await expect(new ModelGateway({ complete: local, describeRequest: () => ({ provider: 'ollama' }) })
@@ -94,11 +94,35 @@ describe('ModelGateway', () => {
     expect(local).toHaveBeenCalledTimes(2);
   });
 
-  it('does not repeat a timed-out step review against the same evidence', async () => {
-    const complete = vi.fn().mockRejectedValue(new Error('Ollama request timed out during planner.review after 180000ms.'));
+  it('retries a timed-out step review once without repeating the host step', async () => {
+    const complete = vi.fn().mockRejectedValue(Object.assign(
+      new Error('Ollama request timed out during planner.review after 120000ms.'), { code: 'TIMEOUT' }));
     const gateway = new ModelGateway({ complete, describeRequest: () => ({ provider: 'ollama' }) });
     await expect(gateway.complete({ taskId: 'task-1', role: 'planner.review', system: '', user: '' },
       z.object({ ok: z.boolean() }))).rejects.toThrow('timed out');
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries rate limits twice and does not retry malformed model output', async () => {
+    const rateLimited = vi.fn().mockRejectedValue(new ModelProviderError('Rate limited', 429));
+    await expect(new ModelGateway({ complete: rateLimited }).complete(
+      { role: 'planner', system: '', user: '' }, z.object({ ok: z.boolean() }))).rejects.toThrow('Rate limited');
+    expect(rateLimited).toHaveBeenCalledTimes(3);
+
+    const malformed = vi.fn().mockRejectedValue(new ModelProviderError('Invalid JSON', 200));
+    await expect(new ModelGateway({ complete: malformed }).complete(
+      { role: 'planner', system: '', user: '' }, z.object({ ok: z.boolean() }))).rejects.toThrow('Invalid JSON');
+    expect(malformed).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels an in-progress retry wait without another provider call', async () => {
+    const complete = vi.fn().mockRejectedValue(new ModelProviderError('Timeout', undefined, undefined, undefined, 'TIMEOUT'));
+    let gateway!: ModelGateway;
+    gateway = new ModelGateway({ complete }, undefined, event => {
+      if (event.status === 'retrying') gateway.cancelTask(event.taskId);
+    });
+    await expect(gateway.complete({ taskId: 'task-1', role: 'planner', system: '', user: '' },
+      z.object({ ok: z.boolean() }))).rejects.toMatchObject({ name: 'TaskCancelledError' });
     expect(complete).toHaveBeenCalledTimes(1);
   });
 

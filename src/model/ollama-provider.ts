@@ -1,9 +1,12 @@
 import type { ModelCompletion, ModelProvider, ModelRequest, ModelRequestDetails } from './gateway.js';
+import { modelTimeoutMs } from './timeout-policy.js';
 
 interface OllamaConfig {
   baseUrl: string;
   model: string;
   timeoutMs?: number;
+  reviewTimeoutMs?: number;
+  routeTimeoutMs?: number;
 }
 
 interface OllamaResponse {
@@ -23,25 +26,31 @@ export class OllamaProvider implements ModelProvider {
     const url = new URL(`${baseUrl}/api/chat`);
     return { provider: 'ollama', endpoint: `${url.origin}${url.pathname}`, model: this.config.model,
       stream: request.role === 'implementer.file', temperature: 0,
-      maxOutputTokens: request.maxOutputTokens ?? 4096, timeoutMs: this.config.timeoutMs ?? 120_000,
+      maxOutputTokens: request.maxOutputTokens ?? 4096, timeoutMs: this.timeoutFor(request),
       responseFormat: request.outputSchema ? 'json-schema' : 'json' };
+  }
+
+  private timeoutFor(request: ModelRequest): number {
+    return modelTimeoutMs(request.role, this.config.timeoutMs ?? 120_000,
+      this.config.reviewTimeoutMs, this.config.routeTimeoutMs);
   }
 
   async complete(request: ModelRequest): Promise<ModelCompletion> {
     const controller = new AbortController();
-    const timeoutMs = this.config.timeoutMs ?? 120_000;
+    const timeoutMs = this.timeoutFor(request);
     const stream = request.role === 'implementer.file';
     // A long file can take more than one request window to generate on a local
     // model. Streaming changes the short timer into an *idle* timer; a separate
     // hard deadline prevents an indefinitely active response.
     let idleTimeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutState: { kind: 'idle' | 'hard' } = { kind: 'idle' };
     const resetIdleTimeout = () => {
       clearTimeout(idleTimeout);
-      idleTimeout = setTimeout(() => controller.abort(), timeoutMs);
+      idleTimeout = setTimeout(() => { timeoutState.kind = 'idle'; controller.abort(); }, timeoutMs);
     };
     resetIdleTimeout();
     const hardLimitMs = stream ? Math.min(600_000, timeoutMs * 4) : timeoutMs;
-    const hardTimeout = stream ? setTimeout(() => controller.abort(), hardLimitMs) : undefined;
+    const hardTimeout = stream ? setTimeout(() => { timeoutState.kind = 'hard'; controller.abort(); }, hardLimitMs) : undefined;
     const baseUrl = this.config.baseUrl.replace(/\/v1\/?$/, '').replace(/\/$/, '');
 
     try {
@@ -89,8 +98,11 @@ export class OllamaProvider implements ModelProvider {
     } catch (error) {
       if (request.signal?.aborted) throw error;
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`Ollama request timed out during ${request.role} after ${timeoutMs}ms${stream ? ' without output or at the hard deadline' : ''}.`);
+        const elapsedLimitMs = timeoutState.kind === 'hard' ? hardLimitMs : timeoutMs;
+        throw Object.assign(new Error(`Ollama request timed out during ${request.role} after ${elapsedLimitMs}ms${stream ? timeoutState.kind === 'hard' ? ' at the hard deadline' : ' without output' : ''}.`),
+          { code: 'TIMEOUT' });
       }
+      if (error instanceof TypeError) throw Object.assign(error, { code: 'TRANSPORT' });
       throw error instanceof Error ? error : new Error('Unknown Ollama provider error.');
     } finally {
       clearTimeout(idleTimeout);

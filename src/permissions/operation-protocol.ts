@@ -52,6 +52,7 @@ export interface CapabilityHost {
     launch(request: { executable: string; args: string[]; cwd?: string }): Promise<{ started: boolean; pid: number | null }>;
   };
   location: { current(): Promise<{ supported: false; reason: string } | { supported: true; latitude: number; longitude: number }> };
+  mcp: { call(server: string, tool: string, args: Record<string, unknown>): Promise<unknown> };
 }
 
 export type HostCallHandler = (call: HostCall) => Promise<HostCallResult>;
@@ -102,6 +103,10 @@ export function createCapabilityHost(call: HostCallHandler): Readonly<Capability
     }),
     location: Object.freeze({
       current: () => invoke('location', 'current', 'device location', 'Retrieve the current device location.', {}) as Promise<{ supported: false; reason: string } | { supported: true; latitude: number; longitude: number }>,
+    }),
+    mcp: Object.freeze({
+      call: (server: string, tool: string, args: Record<string, unknown>) => invoke('mcp', 'call', `${server}/${tool}`,
+        `Call the configured MCP tool ${server}/${tool}.`, { server, tool, arguments: args }),
     }),
   });
 }

@@ -1,10 +1,13 @@
 import type { ModelCompletion, ModelProvider, ModelRequest, ModelRequestDetails } from './gateway.js';
+import { modelTimeoutMs } from './timeout-policy.js';
 
 interface OpenAIConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
   timeoutMs?: number;
+  reviewTimeoutMs?: number;
+  routeTimeoutMs?: number;
 }
 
 interface OpenAIResponse {
@@ -19,6 +22,7 @@ export class ModelProviderError extends Error {
     public readonly statusCode?: number,
     public readonly requestId?: string,
     public readonly rawContent?: string,
+    public readonly code?: 'TIMEOUT' | 'TRANSPORT',
   ) {
     super(message);
     this.name = 'ModelProviderError';
@@ -28,16 +32,21 @@ export class ModelProviderError extends Error {
 export class OpenAICompatibleProvider implements ModelProvider {
   constructor(private readonly config: OpenAIConfig) {}
 
-  describeRequest(_request: ModelRequest): ModelRequestDetails {
-    const url = new URL(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`);
+  describeRequest(request: ModelRequest): ModelRequestDetails {
+    const url = new URL(`${this.config.baseUrl.replace(/\/+$/, '')}/chat/completions`);
     return { provider: 'openai-compatible', endpoint: `${url.origin}${url.pathname}`, model: this.config.model,
-      stream: false, temperature: 0, timeoutMs: this.config.timeoutMs ?? 120_000, responseFormat: 'json-instructions' };
+      stream: false, temperature: 0, timeoutMs: this.timeoutFor(request), responseFormat: 'json-instructions' };
+  }
+
+  private timeoutFor(request: ModelRequest): number {
+    return modelTimeoutMs(request.role, this.config.timeoutMs ?? 120_000,
+      this.config.reviewTimeoutMs, this.config.routeTimeoutMs);
   }
 
   async complete(request: ModelRequest): Promise<ModelCompletion> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs ?? 120_000);
-    const url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`;
+    const timeout = setTimeout(() => controller.abort(), this.timeoutFor(request));
+    const url = `${this.config.baseUrl.replace(/\/+$/, '')}/chat/completions`;
 
     try {
       const response = await fetch(url, {
@@ -90,9 +99,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
       if (request.signal?.aborted) throw error;
       if (error instanceof ModelProviderError) throw error;
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new ModelProviderError('Model request timed out.');
+        throw new ModelProviderError('Model request timed out.', undefined, undefined, undefined, 'TIMEOUT');
       }
-      throw new ModelProviderError(error instanceof Error ? error.message : 'Unknown model provider error.');
+      throw new ModelProviderError(error instanceof Error ? error.message : 'Unknown model provider error.',
+        undefined, undefined, undefined, error instanceof TypeError ? 'TRANSPORT' : undefined);
     } finally {
       clearTimeout(timeout);
     }

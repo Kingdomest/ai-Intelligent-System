@@ -38,7 +38,9 @@ export function compactVerifiedResult(value: unknown, maxText = 8_000): unknown 
 /** A review needs observable evidence, not a second copy of an entire page or file. */
 export function summarizeStepEvidence(value: unknown, depth = 0): unknown {
   if (typeof value === 'string') {
-    const readable = isMarkup(value) ? readableBody(value) : value.replace(/\s+/g, ' ').trim();
+    // Newlines and spaces can be the evidence itself (for example a line-count
+    // input). Keep plain text exact; only flatten actual markup for readability.
+    const readable = isMarkup(value) ? readableBody(value) : value;
     return value.length <= 1_200 ? readable : { characters: value.length, preview: limited(readable, 1_200) };
   }
   if (value === null || typeof value !== 'object') return value;
@@ -81,6 +83,7 @@ export function buildStepReviewContext(input: StepReviewInput): Record<string, u
       ? { status: 'success', output: summarizeStepEvidence(input.outcome.output) }
       : { status: 'failure', failure: input.outcome.failure,
         output: summarizeStepEvidence(input.outcome.output) },
+    ...(input.verification ? { verification: input.verification } : {}),
     remainingSteps: input.plan.steps.filter(step => !input.completedStepIds.includes(step.id)).map(step => ({
       id: step.id, capabilityKey: step.capabilityKey, description: step.description,
       dependsOn: step.dependsOn, input: summarizeStepInput(step.input),

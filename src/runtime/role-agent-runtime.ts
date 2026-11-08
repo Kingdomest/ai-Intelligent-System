@@ -5,6 +5,7 @@ import type { ModelActivityEvent } from '../model/gateway.js';
 const roleNames: Record<string, string> = {
   planner: '规划 Agent', implementer: '实施 Agent', tester: '测试 Agent',
   evaluator: '评估 Agent', responder: '回答 Agent', presentation: '演示文稿 Agent',
+  tool_selector: '工具选择 Agent',
 };
 
 /** Gives each model role a durable child identity under its task's coordinator. */
@@ -13,6 +14,13 @@ export class RoleAgentRuntime {
 
   onActivity(activity: ModelActivityEvent): AgentSessionRecord | null {
     const family = activity.role.split('.')[0] ?? '';
+    if (/^task-worker-\d+$/.test(family)) {
+      const worker = this.protocol.listAgents(activity.taskId).find(agent => agent.role === family);
+      if (!worker) return null;
+      const status: AgentStatus = activity.status === 'running' || activity.status === 'retrying'
+        ? 'running' : activity.status === 'cancelled' ? 'cancelled' : 'waiting';
+      return this.protocol.store.updateAgentStatus(worker.id, status);
+    }
     const name = roleNames[family];
     if (!name) return null;
     const agents = this.protocol.listAgents(activity.taskId);

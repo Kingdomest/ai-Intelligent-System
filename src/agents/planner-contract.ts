@@ -8,6 +8,12 @@ export interface ValidatedPlanStep {
   description: string;
   dependsOn: string[];
   input: Record<string, unknown>;
+  /** Runtime-only original arguments retained when a generated file becomes concrete content. */
+  assignmentInput?: Record<string, unknown>;
+  acceptanceCriteria?: string[];
+  parameterDescriptions?: Record<string, string>;
+  /** Runtime-only schema of the MCP tool chosen after planning. */
+  mcpInputSchema?: unknown;
 }
 
 export interface ValidatedPlannerDecision {
@@ -49,6 +55,8 @@ const inputSchemas: Record<string, z.ZodType<Record<string, unknown>>> = {
   'process.run': z.object({ command: nonEmpty, args: z.array(z.string()).max(100), cwd: nonEmpty.optional() }).strict(),
   'network.request': z.object({ url: networkUrl, method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']), headers: z.record(z.string(), z.string()).optional(), body: z.string().optional() }).strict(),
   'location.current': z.object({}).strict(),
+  'mcp.call': z.object({ server: nonEmpty, tool: nonEmpty,
+    dynamicArgs: z.record(z.string(), z.unknown()).default({}) }).strict(),
   'text.count_lines': z.object({ text: z.string().max(100_000) }).strict(),
   'text.replace': z.object({ text: z.string().max(40_000), search: nonEmpty.max(1_000), replacement: z.string().max(1_000) }).strict(),
   'json.format': z.object({ text: nonEmpty.max(40_000) }).strict(),
@@ -63,11 +71,15 @@ const requestSchema = z.object({
 });
 const requiredCapabilitySchema = z.object({ name: nonEmpty, purpose: nonEmpty, riskLevel: z.enum(['low', 'medium', 'high']) });
 export const plannerStepSchema = z.object({
-  id: nonEmpty,
+  id: nonEmpty.max(100),
   capabilityKey: nonEmpty,
   description: nonEmpty,
-  dependsOn: z.array(nonEmpty),
+  dependsOn: z.array(nonEmpty.max(100)),
   input: z.record(z.string(), z.unknown()),
+  assignmentInput: z.record(z.string(), z.unknown()).optional(),
+  mcpInputSchema: z.unknown().optional(),
+  acceptanceCriteria: z.array(nonEmpty).min(1).optional(),
+  parameterDescriptions: z.record(z.string(), nonEmpty).optional(),
 });
 const plannerBaseSchema = z.object({
   intent: z.string().optional(),
@@ -125,7 +137,7 @@ export function parsePlannerDecision(raw: unknown): ValidatedPlannerDecision {
 }
 
 const observedDataKeys = new Set(['network.request', 'filesystem.read_text', 'location.current', 'process.run',
-  'text.count_lines', 'text.replace', 'json.format']);
+  'text.count_lines', 'text.replace', 'json.format', 'mcp.call']);
 
 /** A file that depends on live observations must be written from those observations at execution time. */
 export function hasObservedDataDependency(steps: Array<Pick<ValidatedPlanStep, 'id' | 'dependsOn'>
@@ -216,6 +228,25 @@ export function validateStepInput(capabilityKey: string, input: Record<string, u
 
 /** Correct only unambiguous model-shape mistakes; never invent operation arguments. */
 function normalizeKnownPlannerInput(capabilityKey: string, input: Record<string, unknown>): Record<string, unknown> {
+  if ((capabilityKey === 'process.launch' || capabilityKey === 'process.run')
+    && input.args === undefined && input.dynamicArgs !== undefined) {
+    let candidate: unknown = input.dynamicArgs;
+    for (let depth = 0; depth < 3 && candidate && typeof candidate === 'object'
+      && !Array.isArray(candidate); depth += 1) {
+      const wrapper = candidate as Record<string, unknown>;
+      const keys = Object.keys(wrapper);
+      if (keys.some(key => !['args', 'items', 'length'].includes(key))
+        || (keys.includes('args') === keys.includes('items'))
+        || (keys.includes('length') && (!Number.isInteger(wrapper.length) || Number(wrapper.length) < 0))) break;
+      candidate = wrapper.args ?? wrapper.items;
+    }
+    if (Array.isArray(candidate) && candidate.length <= 100
+      && candidate.every(item => typeof item === 'string')
+      && Object.keys(input).every(key => ['command', 'cwd', 'applicationName', 'dynamicArgs', 'name', 'instruction'].includes(key))) {
+      const { dynamicArgs: _dynamicArgs, name: _name, instruction: _instruction, ...operation } = input;
+      return { ...operation, args: candidate };
+    }
+  }
   if ((capabilityKey === 'process.launch' || capabilityKey === 'process.run')
     && input.args && typeof input.args === 'object' && !Array.isArray(input.args)
     && Object.keys(input.args).length === 0) {

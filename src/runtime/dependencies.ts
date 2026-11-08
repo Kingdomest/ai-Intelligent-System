@@ -16,6 +16,7 @@ import { OllamaProvider } from '../model/ollama-provider.js';
 import { AgentLoop } from './agent-loop.js';
 import { AgentController } from './agent-controller.js';
 import { RoleAgentRuntime } from './role-agent-runtime.js';
+import { TaskCollaborationRuntime } from './task-collaboration.js';
 import { BudgetManager } from './budget-manager.js';
 import { AdaptiveScheduler } from './scheduler.js';
 import { SessionService } from './session-service.js';
@@ -26,6 +27,8 @@ import { DefaultHostOperationExecutor } from '../permissions/host-operations.js'
 import { PermissionBroker } from '../permissions/permission-broker.js';
 import { TestExecutor } from './test-executor.js';
 import { WindowsDesktopObserver } from './windows-desktop-observer.js';
+import { McpService } from '../mcp/service.js';
+import { ToolDiscovery } from '../capabilities/tool-discovery.js';
 
 export interface RuntimeConfig {
   dataDir: string;
@@ -36,6 +39,9 @@ export interface RuntimeConfig {
   modelApiKey: string;
   modelName: string;
   modelRequestTimeoutMs: number;
+  modelReviewTimeoutMs: number;
+  modelRouteTimeoutMs: number;
+  mcpConfigPath?: string;
   maxConcurrency: number;
   maxRetries: number;
   maxSteps: number;
@@ -52,6 +58,8 @@ export interface RuntimeDependencies {
   sessionService: SessionService;
   a2aProtocol: A2AProtocol;
   agentController: AgentController;
+  mcp: McpService;
+  toolDiscovery: ToolDiscovery;
 }
 
 export function createDependencies(overrides: Partial<RuntimeConfig> = {}): RuntimeDependencies {
@@ -68,9 +76,12 @@ export function createDependencies(overrides: Partial<RuntimeConfig> = {}): Runt
         ? 'openai'
         : 'ollama',
     modelBaseUrl: process.env.MODEL_BASE_URL ?? 'http://127.0.0.1:11434/v1',
-    modelApiKey: process.env.MODEL_API_KEY ?? 'ollama',
+    modelApiKey: process.env.MODEL_API_KEY ?? '',
     modelName: process.env.MODEL_NAME ?? 'qwen3.6-27b-tools:latest',
     modelRequestTimeoutMs: configuredModelTimeout(process.env.MODEL_REQUEST_TIMEOUT_MS),
+    modelReviewTimeoutMs: configuredModelTimeout(process.env.MODEL_REVIEW_TIMEOUT_MS, 120_000),
+    modelRouteTimeoutMs: configuredModelTimeout(process.env.MODEL_ROUTE_TIMEOUT_MS, 180_000),
+    mcpConfigPath: process.env.JARVIS_MCP_CONFIG?.trim() || undefined,
     maxConcurrency: 3,
     maxRetries: 5,
     maxSteps: 50,
@@ -78,6 +89,10 @@ export function createDependencies(overrides: Partial<RuntimeConfig> = {}): Runt
     outputReserveTokens: 4_000,
     ...overrides,
   };
+
+  if (config.modelMode === 'openai' && !config.modelApiKey.trim()) {
+    throw new Error('MODEL_API_KEY is required when MODEL_MODE=openai. Set it in your local .env file.');
+  }
 
   mkdirSync(config.dataDir, { recursive: true });
   const store = new SqliteStore(join(config.dataDir, 'jarvis.sqlite'));
@@ -88,15 +103,20 @@ export function createDependencies(overrides: Partial<RuntimeConfig> = {}): Runt
     ? new MockModelProvider()
     : config.modelMode === 'ollama'
       ? new OllamaProvider({ baseUrl: config.modelBaseUrl, model: config.modelName,
-        timeoutMs: config.modelRequestTimeoutMs })
+        timeoutMs: config.modelRequestTimeoutMs,
+        reviewTimeoutMs: config.modelReviewTimeoutMs, routeTimeoutMs: config.modelRouteTimeoutMs })
       : new OpenAICompatibleProvider({
         baseUrl: config.modelBaseUrl,
         apiKey: config.modelApiKey,
         model: config.modelName,
         timeoutMs: config.modelRequestTimeoutMs,
+        reviewTimeoutMs: config.modelReviewTimeoutMs,
+        routeTimeoutMs: config.modelRouteTimeoutMs,
       });
   const a2aProtocol = new A2AProtocol(store);
   const roleAgentRuntime = new RoleAgentRuntime(a2aProtocol);
+  const mcp = new McpService(workspaceRoot, config.dataDir, config.mcpConfigPath);
+  const toolDiscovery = new ToolDiscovery(mcp);
   const gateway = new ModelGateway(modelProvider, {
     start: (request, details) => store.startModelTrace(request, details?.model ?? config.modelName, details),
     finish: (id, outcome) => store.finishModelTrace(id, outcome),
@@ -109,12 +129,12 @@ export function createDependencies(overrides: Partial<RuntimeConfig> = {}): Runt
   });
   const agentController = new AgentController(a2aProtocol);
   const agents = new AgentRunner(gateway, process.env.BRAVE_SEARCH_API_KEY?.trim()
-    ? new BraveWebSearch(process.env.BRAVE_SEARCH_API_KEY.trim()) : undefined);
+    ? new BraveWebSearch(process.env.BRAVE_SEARCH_API_KEY.trim()) : undefined, mcp);
   const tester = new TestAgent(gateway);
   const sandbox = new SandboxRunner();
   const registry = new CapabilityRegistry(store, sandbox);
   registry.installBuiltins();
-  const permissionBroker = new PermissionBroker(store, new DefaultHostOperationExecutor(), workspaceRoot);
+  const permissionBroker = new PermissionBroker(store, new DefaultHostOperationExecutor({ mcp }), workspaceRoot);
   const sessionService = new SessionService(store, gateway,
     sessionMemoryBudgetTokens(config.maxContextTokens, config.outputReserveTokens));
   const loop = new AgentLoop({
@@ -125,15 +145,14 @@ export function createDependencies(overrides: Partial<RuntimeConfig> = {}): Runt
     desktopObserver: new WindowsDesktopObserver(),
     factory: new ToolFactory(agents),
     registry,
+    toolDiscovery,
     sandbox,
     budget: new BudgetManager({
       maxContextTokens: config.maxContextTokens,
       outputReserveTokens: config.outputReserveTokens,
-      maxTaskDurationMs: 120_000,
-      maxSteps: config.maxSteps,
-      maxRetries: config.maxRetries,
     }),
     scheduler: new AdaptiveScheduler({ maxConcurrency: config.maxConcurrency }),
+    collaboration: new TaskCollaborationRuntime(a2aProtocol, config.maxConcurrency),
     maxRetries: config.maxRetries,
     maxSteps: config.maxSteps,
     permissionBroker,
@@ -147,15 +166,15 @@ export function createDependencies(overrides: Partial<RuntimeConfig> = {}): Runt
   return {
     config, store, modelProvider,
     taskService: new TaskService(store, loop, permissionBroker, sessionService, roleAgentRuntime),
-    registry, sessionService, a2aProtocol, agentController,
+    registry, sessionService, a2aProtocol, agentController, mcp, toolDiscovery,
   };
 }
 
-function configuredModelTimeout(value: string | undefined): number {
-  if (value === undefined || value === '') return 180_000;
+function configuredModelTimeout(value: string | undefined, fallback = 300_000): number {
+  if (value === undefined || value === '') return fallback;
   const milliseconds = Number(value);
   if (!Number.isInteger(milliseconds) || milliseconds < 30_000 || milliseconds > 600_000) {
-    throw new Error('MODEL_REQUEST_TIMEOUT_MS must be an integer from 30000 to 600000.');
+    throw new Error('Model timeout must be an integer from 30000 to 600000 milliseconds.');
   }
   return milliseconds;
 }

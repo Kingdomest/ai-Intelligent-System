@@ -11,6 +11,7 @@ const supportedActions: Record<PermissionOperation['permission'], Set<string>> =
   network: new Set(['request']),
   process: new Set(['run', 'launch']),
   location: new Set(['current']),
+  mcp: new Set(['call']),
 };
 
 export class PermissionPolicy {

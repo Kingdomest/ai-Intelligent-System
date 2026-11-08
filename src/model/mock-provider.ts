@@ -8,6 +8,12 @@ export class MockModelProvider implements ModelProvider {
 
   async complete(request: ModelRequest): Promise<ModelCompletion> {
     this.calls += 1;
+    if (/^task-worker-\d+\.tool_search$/.test(request.role)) {
+      return this.completion({ queries: ['count lines text'] });
+    }
+    if (/^task-worker-\d+\.tool_select$/.test(request.role)) {
+      return this.completion({ action: 'create', reason: 'Use deterministic mock generated tool.' });
+    }
     if (request.role === 'planner.route') {
       const input = JSON.parse(request.user) as { clarification?: unknown };
       return this.completion({ status: 'ready', ...(input.clarification ? { clarificationValid: true } : {}) });
@@ -65,7 +71,7 @@ export class MockModelProvider implements ModelProvider {
     if (request.role === 'tester.review') return this.completion({ verdict: 'pass', reason: 'Deterministic checks passed.' });
     if (request.role === 'tester.answer') return this.completion({ verdict: 'pass', reason: 'Answer structure passed.' });
 
-    if (request.role === 'implementer') {
+    if (request.role === 'implementer' || /^task-worker-\d+\.tool_create$/.test(request.role)) {
       return this.completion({
         kind: 'tool_candidate',
         candidate: {

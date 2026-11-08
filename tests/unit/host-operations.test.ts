@@ -38,6 +38,29 @@ afterEach(async () => {
 });
 
 describe('DefaultHostOperationExecutor', () => {
+  it.skipIf(process.platform !== 'win32')('stops a timed-out process and its descendant on Windows', async () => {
+    const root = await workspace();
+    const pidFile = join(root, 'descendant.pid');
+    const script = `const fs=require('node:fs'); const {spawn}=require('node:child_process'); `
+      + `const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); `
+      + `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid)); setInterval(()=>{},1000);`;
+    const executor = new DefaultHostOperationExecutor({ timeoutMs: 400 });
+    const result = await executor.execute(call({ permission: 'process', action: 'run', target: process.execPath,
+      arguments: { command: process.execPath, args: ['-e', script], cwd: root } }),
+    executionContext(root, 'full', false, ['process']));
+    expect(result).toMatchObject({ ok: false, error: { message: expect.stringContaining('timed out') } });
+    const pid = Number(await readFile(pidFile, 'utf8'));
+    const running = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      for (let attempt = 0; attempt < 10 && running(); attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      expect(running()).toBe(false);
+    } finally {
+      if (running()) { try { process.kill(pid); } catch { /* Already stopped. */ } }
+    }
+  });
+
   it('does not run a shell command that starts a GUI app through the short-command API', async () => {
     const root = await workspace();
     const runProcess = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
@@ -127,6 +150,7 @@ describe('DefaultHostOperationExecutor', () => {
     }), executionContext(root, 'full', false, ['process']));
     expect(processResult.value).toEqual({ exitCode: 0, stdout: 'ok', stderr: '' });
     expect(runProcess).toHaveBeenCalledOnce();
+    expect(runProcess).toHaveBeenCalledWith('node', [], expect.any(String), 120_000, 100_000);
   });
 
   it('keeps automatic network execution within the public read-only boundary', async () => {
@@ -139,6 +163,18 @@ describe('DefaultHostOperationExecutor', () => {
     expect(result.ok).toBe(false);
     expect(result.error?.code).toBe('NETWORK_POLICY');
     expect(fakeFetch).not.toHaveBeenCalled();
+  });
+
+  it('includes automatic DNS lookup in the network deadline', async () => {
+    const executor = new DefaultHostOperationExecutor({
+      timeoutMs: 5,
+      lookup: async () => new Promise<Array<{ address: string; family: number }>>(() => undefined),
+    });
+    const result = await executor.execute(call({
+      permission: 'network', action: 'request', target: 'https://example.test/public',
+      arguments: { url: 'https://example.test/public', method: 'GET' },
+    }), executionContext(await workspace(), 'auto', false, ['network']));
+    expect(result).toMatchObject({ ok: false, error: { code: 'NETWORK_TIMEOUT' } });
   });
 
   it('pins automatic HTTPS requests to a previously validated public DNS address', async () => {

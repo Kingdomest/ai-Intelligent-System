@@ -11,9 +11,8 @@ export type AgentChildSpec = Omit<CreateAgentInput, 'parentAgentId' | 'rootTaskI
 export type AgentSendInput = Omit<SendAgentMessageInput, 'senderAgentId'>;
 
 /**
- * Orchestrates the parent side of a dynamic team.  The controller deliberately
- * does not run model turns; it creates bounded identities and routes messages
- * through the protocol so a future execution loop can subscribe to the inbox.
+ * Orchestrates the parent side of a dynamic team. The execution loop delegates
+ * validated steps to these bounded identities and exchanges durable messages.
  */
 export class AgentController {
   constructor(private readonly protocol: A2AProtocol) {}

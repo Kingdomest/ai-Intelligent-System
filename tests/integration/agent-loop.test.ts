@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentRunner, type EvaluatorDecision, type PlannerDecision, type ToolCandidate } from '../../src/agents/agent-runner.js';
+import { A2AProtocol } from '../../src/agents/a2a-protocol.js';
 import { TestAgent } from '../../src/agents/test-agent.js';
 import { CapabilityRegistry } from '../../src/capabilities/registry.js';
 import { SandboxRunner } from '../../src/capabilities/sandbox-runner.js';
@@ -20,12 +22,14 @@ import type { ApplicationResolution } from '../../src/runtime/windows-app-resolv
 import { BudgetManager } from '../../src/runtime/budget-manager.js';
 import { AdaptiveScheduler } from '../../src/runtime/scheduler.js';
 import { TaskService } from '../../src/runtime/task-service.js';
+import { TaskCollaborationRuntime } from '../../src/runtime/task-collaboration.js';
 import { SqliteStore } from '../../src/storage/sqlite-store.js';
 
 const temporaryDirectories: string[] = [];
 const testStores: SqliteStore[] = [];
 
-function createService(agents: AgentServices = new AgentRunner(new ModelGateway(new MockModelProvider()))) {
+function createService(agents: AgentServices = new AgentRunner(new ModelGateway(new MockModelProvider())),
+  withCollaboration = false) {
   const directory = mkdtempSync(join(tmpdir(), 'jarvis-loop-'));
   temporaryDirectories.push(directory);
   const store = new SqliteStore(join(directory, 'jarvis.sqlite'));
@@ -35,6 +39,7 @@ function createService(agents: AgentServices = new AgentRunner(new ModelGateway(
   const executor = new DefaultHostOperationExecutor();
   const permissionBroker = new PermissionBroker(store, executor, directory);
   const factory = new ToolFactory(agents);
+  const protocol = withCollaboration ? new A2AProtocol(store) : undefined;
   const loop = new AgentLoop({
     store,
     agents,
@@ -46,13 +51,14 @@ function createService(agents: AgentServices = new AgentRunner(new ModelGateway(
     sandbox,
     budget: new BudgetManager({ maxContextTokens: 32_000, outputReserveTokens: 4_000 }),
     scheduler: new AdaptiveScheduler({ maxConcurrency: 3 }),
+    collaboration: protocol ? new TaskCollaborationRuntime(protocol) : undefined,
     maxRetries: 5,
     maxSteps: 50,
     permissionBroker,
     workspaceRoot: directory,
     desktopDirectory: join(directory, 'Desktop'),
   });
-  return { service: new TaskService(store, loop, permissionBroker), store, directory };
+  return { service: new TaskService(store, loop, permissionBroker), store, directory, protocol };
 }
 
 afterEach(() => {
@@ -65,6 +71,100 @@ afterEach(() => {
 });
 
 describe('AgentLoop', () => {
+  it('runs delegated steps with peer result requests and main Agent review', async () => {
+    const reviewed: string[] = [];
+    let reviewProtocol: A2AProtocol;
+    const agents: AgentServices = {
+      runPlanner: async input => ({ status: 'ready', intent: 'read two files',
+        acceptanceCriteria: ['Both files were read'], requiredCapabilities: [], steps: [
+          { id: 'a', capabilityKey: 'filesystem.read_text', description: 'Read first', dependsOn: [],
+            input: { path: join(input.workspaceRoot!, 'a.txt') } },
+          { id: 'b', capabilityKey: 'filesystem.read_text', description: 'Read second using first result',
+            dependsOn: ['a'], input: { path: join(input.workspaceRoot!, 'b.txt') } },
+        ] }),
+      runPlannerReview: async input => {
+        const root = reviewProtocol.listAgents(input.taskId).find(agent => agent.role === 'orchestrator')!;
+        expect(reviewProtocol.listInbox(root.id).some(message => message.type === 'artifact'
+          && (message.payload as { stepId?: string }).stepId === input.step.id
+          && message.status === 'read')).toBe(true);
+        reviewed.push(input.step.id);
+        return { action: 'continue', reason: 'The observed result satisfies this step.' };
+      },
+      runImplementer: async () => { throw new Error('Use the maintained reader.'); },
+      runResponder: async input => input.results.map(result => (result.output as { content: string }).content).join(', '),
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+    };
+    const { service, store, directory, protocol } = createService(agents, true);
+    reviewProtocol = protocol!;
+    writeFileSync(join(directory, 'a.txt'), 'first');
+    writeFileSync(join(directory, 'b.txt'), 'second');
+    const task = await service.createAndWait({ message: 'Read both files', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    expect(reviewed).toEqual(['a', 'b']);
+    const all = protocol!.listAgents(task.id);
+    expect(all.filter(agent => agent.role.startsWith('task-worker-'))).toHaveLength(2);
+    const root = all.find(agent => agent.role === 'orchestrator')!;
+    const workers = all.filter(agent => agent.role.startsWith('task-worker-'))
+      .sort((left, right) => left.role.localeCompare(right.role));
+    const peerRequest = protocol!.listInbox(workers[0]!.id).find(message => message.type === 'request'
+      && (message.payload as { kind?: string }).kind === 'dependency.request')!;
+    const peerResponse = protocol!.listInbox(workers[1]!.id).find(message => message.type === 'response')!;
+    expect(peerRequest.senderAgentId).toBe(workers[1]!.id);
+    expect(peerResponse).toMatchObject({ correlationId: peerRequest.id, status: 'read' });
+    expect(protocol!.listInbox(root.id).filter(message => message.type === 'artifact')).toHaveLength(2);
+    expect(store.listEvents(task.id).some(event => event.type === 'plan.reviewed')).toBe(true);
+    expect(store.listEvents(task.id).map(event => event.type)).toEqual(expect.arrayContaining([
+      'team.dispatched', 'agent.peer_exchange', 'agent.result_reported',
+    ]));
+  });
+
+  it('sends a reviewed plan change to child Agents without replaying completed work', async () => {
+    let firstPath = '';
+    let replacementPath = '';
+    const agents: AgentServices = {
+      runPlanner: async input => {
+        firstPath = join(input.workspaceRoot!, 'first.txt');
+        replacementPath = join(input.workspaceRoot!, 'replacement.txt');
+        return { status: 'ready', intent: 'read relevant evidence', acceptanceCriteria: ['Read two sources'],
+          requiredCapabilities: [], steps: [
+            { id: 'first', capabilityKey: 'filesystem.read_text', description: 'Read first',
+              dependsOn: [], input: { path: firstPath } },
+            { id: 'outdated', capabilityKey: 'filesystem.read_text', description: 'Read outdated',
+              dependsOn: ['first'], input: { path: join(input.workspaceRoot!, 'outdated.txt') } },
+          ] };
+      },
+      runPlannerReview: async input => input.step.id === 'first'
+        ? { action: 'replan', reason: 'Use the replacement source.', plan: {
+          status: 'ready', intent: 'read replacement evidence', acceptanceCriteria: ['Read two sources'],
+          requiredCapabilities: [], steps: [
+            { id: 'first', capabilityKey: 'filesystem.read_text', description: 'Read first',
+              dependsOn: [], input: { path: firstPath } },
+            { id: 'replacement', capabilityKey: 'filesystem.read_text', description: 'Read replacement',
+              dependsOn: ['first'], input: { path: replacementPath } },
+          ],
+        } }
+        : { action: 'continue', reason: 'Replacement source was read.' },
+      runImplementer: async () => { throw new Error('Use the maintained reader.'); },
+      runResponder: async input => input.results.map(result => (result.output as { content: string }).content).join(', '),
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+    };
+    const { service, store, directory, protocol } = createService(agents, true);
+    writeFileSync(join(directory, 'first.txt'), 'first evidence');
+    writeFileSync(join(directory, 'replacement.txt'), 'replacement evidence');
+    const task = await service.createAndWait({ message: 'Read relevant evidence', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    expect(store.listStepOperations(task.id, 'first', '1.0.0')).toHaveLength(1);
+    expect(store.listStepOperations(task.id, 'outdated', '1.0.0')).toHaveLength(0);
+    expect(store.listStepOperations(task.id, 'replacement', '1.0.0')).toHaveLength(1);
+    const workers = protocol!.listAgents(task.id).filter(agent => agent.role.startsWith('task-worker-'));
+    expect(workers).toHaveLength(2);
+    expect(workers.flatMap(worker => protocol!.listInbox(worker.id)).some(message => message.type === 'request'
+      && (message.payload as { stepId?: string }).stepId === 'replacement')).toBe(true);
+    expect(store.listEvents(task.id).some(event => event.type === 'plan.revised')).toBe(true);
+  });
+
   it('uses a maintained text tool without asking the model to generate one', async () => {
     const agents: AgentServices = {
       runPlanner: async () => ({ status: 'ready', intent: 'replace text', acceptanceCriteria: ['replacement complete'],
@@ -1267,7 +1367,9 @@ describe('AgentLoop', () => {
     expect(responseInput.message).toBe('广东深圳的天气怎么样');
     const finalEvaluation = modelRequests.filter(request => request.role === 'evaluator')
       .map(request => JSON.parse(request.user)).find(request => request.target === 'task-answer');
-    expect(finalEvaluation.output.message).toBe('广东深圳的天气怎么样');
+    expect(finalEvaluation).toBeUndefined();
+    expect(store.listEvents(task.id).some(event => event.type === 'test.report')).toBe(false);
+    expect(store.listEvents(task.id).some(event => event.type === 'step.verified')).toBe(true);
     expect(modelRequests.filter(request => request.role === 'evaluator')
       .map(request => JSON.parse(request.user)).filter(request => request.target === 'network.request')).toHaveLength(0);
     expect(responseInput.results[0]).toMatchObject({ stepId: 'weather',
@@ -1439,13 +1541,51 @@ describe('AgentLoop', () => {
     expect(task.result).toContain('v24.0.0');
   });
 
+  it('reviews an existing verified source archive without running git or deleting files', async () => {
+    const remote = 'https://github.com/deepseek-ai/deepseek-harness.git';
+    const agents: AgentServices = {
+      runPlanner: async input => {
+        const destination = join(input.workspaceRoot!, 'deepseek-code');
+        return { status: 'ready', intent: 'get repository source', acceptanceCriteria: ['Source code is in destination'],
+          requiredCapabilities: [], steps: [
+            { id: 'folder', capabilityKey: 'filesystem.mkdir', description: 'Create destination', dependsOn: [],
+              input: { path: destination } },
+            { id: 'clone', capabilityKey: 'process.run', description: 'Get source', dependsOn: ['folder'],
+              input: { command: 'git', args: ['clone', '--depth', '1', remote, '.'], cwd: destination } },
+          ] };
+      },
+      runImplementer: async () => { throw new Error('Built-ins must be reused'); },
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+      runPlannerReview: async input => ({ action: 'continue', reason: `Verified ${input.step.id}` }),
+    };
+    const { service, store, directory } = createService(agents);
+    const destination = join(directory, 'deepseek-code');
+    mkdirSync(destination);
+    const readme = '# DeepSeek Harness';
+    const pkg = '{"name":"@deepseek-ai/dsh-root"}';
+    writeFileSync(join(destination, 'README.md'), readme);
+    writeFileSync(join(destination, 'package.json'), pkg);
+    const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+    writeFileSync(join(destination, '.jarvis-source.json'), JSON.stringify({ schemaVersion: 1,
+      kind: 'github-source-archive', repositoryUrl: remote.replace(/\.git$/, ''),
+      readmeSha256: hash(readme), packageSha256: hash(pkg) }));
+    const task = await service.createAndWait({ message: '把该仓库的代码放到 deepseek-code', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    expect(task.result).toContain('源码归档');
+    expect(store.listStepOperations(task.id, 'clone', '1.0.0')).toHaveLength(0);
+    expect(store.listEvents(task.id).some(event => event.type === 'step.verified'
+      && event.payload.source === 'existing_repository')).toBe(true);
+  });
+
   it('reuses one launch capability for two distinct applications after real-observation evidence', async () => {
     const base = new AgentRunner(new ModelGateway(new MockModelProvider()));
+    let evaluatorCalls = 0;
     const agents: AgentServices = {
       runPlanner: async (input) => ({ intent: 'launch a local application', acceptanceCriteria: ['window foreground'], requiredCapabilities: [],
         steps: [{ id: 'launch', capabilityKey: 'process.launch', description: 'Launch app', dependsOn: [],
           input: { applicationName: input.message.includes('网易') ? '网易云音乐' : '百度网盘', args: [] } }], status: 'ready' }),
-      runEvaluator: (input) => base.runEvaluator(input),
+      runEvaluator: (input) => { evaluatorCalls += 1; return base.runEvaluator(input); },
       runImplementer: (input) => base.runImplementer(input),
     };
     const { store, directory } = createService(agents);
@@ -1469,6 +1609,10 @@ describe('AgentLoop', () => {
     expect(calls.map((call) => call.target)).toEqual(['C:\\Apps\\cloudmusic.exe', 'C:\\Apps\\BaiduNetdisk.exe']);
     expect(first.metrics.generatedCapabilityCount + second.metrics.generatedCapabilityCount).toBe(0);
     expect(store.getActive('process.launch')?.version).toBe('1.0.0');
+    expect(evaluatorCalls).toBe(0);
+    expect([...store.listEvents(first.id), ...store.listEvents(second.id)]
+      .filter(event => event.type === 'test.report')).toHaveLength(0);
+    expect(store.listEvents(first.id).some(event => event.type === 'step.verified')).toBe(true);
   });
 
   it('binds a directory step and a read step to their own reusable capabilities', async () => {
@@ -1731,7 +1875,7 @@ describe('AgentLoop', () => {
     const { service, store } = createService(agents);
     const task = await service.createAndWait({ message: '统计上传内容有多少行', attachments: [{ id: 'f', filename: 'x', mimeType: 'text/plain', size: 4, content: 'a\nb\n' }] });
 
-    expect(task.status).toBe('COMPLETED');
+    expect(task.status, task.result).toBe('COMPLETED');
     expect(task.metrics.retryCount).toBe(1);
     store.close();
   });
@@ -2021,7 +2165,7 @@ describe('AgentLoop', () => {
     const service = new TaskService(store, loop, broker);
     const task = await service.createAndWait({ message: 'Create hm', attachments: [], permissionMode: 'auto' });
 
-    expect(task.status).toBe('COMPLETED');
+    expect(task.status, task.result).toBe('COMPLETED');
     expect(task.metrics.retryCount).toBe(1);
     expect(executor.execute).toHaveBeenCalledTimes(1);
     store.close();

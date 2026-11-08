@@ -3,6 +3,7 @@ dist/
 web/dist/
 .env*
 !.env.example
+.mcp.json
 data/
 .superpowers/
 .candidate-2026-09-24-self-repair/

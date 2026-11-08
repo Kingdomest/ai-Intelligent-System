@@ -7,7 +7,9 @@
     "node": ">=24"
   },
   "overrides": {
-    "pptxgenjs": { "image-size": "2.0.4" }
+    "pptxgenjs": {
+      "image-size": "2.0.4"
+    }
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
@@ -21,6 +23,9 @@
     "@fastify/cors": "^10.0.2",
     "@fastify/multipart": "^9.2.1",
     "@fastify/static": "^10.1.4",
+    "@modelcontextprotocol/client": "2.4.0",
+    "@modelcontextprotocol/server-filesystem": "2.2.0",
+    "@modelcontextprotocol/server-memory": "2.1.0",
     "dotenv": "^17.2.2",
     "fastify": "^5.4.0",
     "jszip": "3.10.1",

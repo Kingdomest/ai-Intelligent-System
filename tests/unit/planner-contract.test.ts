@@ -72,6 +72,25 @@ describe('planner contract', () => {
     ]);
   });
 
+  it('unwraps the recorded git clone argument nesting without changing the command', () => {
+    const args = ['clone', 'https://github.com/deepseek-ai/deepseek-harness.git', '.'];
+    const base = { id: 'clone_repo', capabilityKey: 'process.run', description: 'Clone repository',
+      dependsOn: [], input: { command: 'git', cwd: 'C:/Users/Administrator/Desktop/deepseek-code',
+        dynamicArgs: { args: { args } } } };
+    const plan = parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [base] });
+    expect(plan.steps[0]?.input).toEqual({ command: 'git', cwd: base.input.cwd, args });
+    const replanned = parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [{ ...base,
+      input: { command: 'git', cwd: base.input.cwd, name: 'git clone', instruction: 'Use a shallow clone',
+        dynamicArgs: { args: { length: 4, items: args } } } }] });
+    expect(replanned.steps[0]?.input).toEqual({ command: 'git', cwd: base.input.cwd, args });
+    const alternate = parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [{ ...base,
+      input: { command: 'git', cwd: base.input.cwd, name: 'git clone', instruction: 'Use a shallow clone',
+        dynamicArgs: { items: { length: 4, items: args } } } }] });
+    expect(alternate.steps[0]?.input).toEqual({ command: 'git', cwd: base.input.cwd, args });
+    expect(() => parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [{ ...base,
+      input: { ...base.input, args: ['status'] } }] })).toThrow(/steps\[0\]\.input/);
+  });
+
   it('does not guess nonempty argument objects or accept unbounded file briefs', () => {
     const launch = { id: 'launch', capabilityKey: 'process.launch', description: 'Open app', dependsOn: [],
       input: { applicationName: 'Demo', args: { unknown: 'value' } } };

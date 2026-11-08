@@ -14,6 +14,30 @@ function branchSchema(schema: unknown, status: string): any {
 }
 
 describe('AgentRunner', () => {
+  it('gives the assigned worker tool candidates and validates its choice', async () => {
+    const roles: string[] = [];
+    let offered: any;
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      roles.push(request.role);
+      if (request.role.endsWith('.tool_search')) return { data: { queries: ['search files'] },
+        usage: { inputTokens: 1, outputTokens: 1 } };
+      offered = JSON.parse(request.user);
+      return { data: { action: 'use', toolId: 'mcp:filesystem/search_files',
+        arguments: { path: 'D:/work', pattern: '*.md' }, reason: 'Matches' },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const common = { taskId: 'task-1', description: 'Search Markdown files',
+      purpose: 'Find Markdown files', capabilityKey: 'dynamic.files.search', workerRole: 'task-worker-0' };
+    expect(await runner.runToolSearch(common)).toEqual(['search files']);
+    expect(await runner.runToolSelection({ ...common, stepInput: { path: 'D:/work' }, candidates: [{
+      id: 'mcp:filesystem/search_files', source: 'mcp', name: 'search_files', server: 'filesystem',
+      description: 'Search files by pattern', inputSchema: { required: ['path', 'pattern'] }, readOnly: true,
+    }] })).toMatchObject({ action: 'use', toolId: 'mcp:filesystem/search_files' });
+    expect(roles).toEqual(['task-worker-0.tool_search', 'task-worker-0.tool_select']);
+    expect(offered.candidates[0]).toMatchObject({ id: 'mcp:filesystem/search_files',
+      inputSchema: expect.stringContaining('pattern') });
+  });
+
   it('uses the routed scenario to compose a focused planner system prompt', async () => {
     let plannerSystem = '';
     const runner = new AgentRunner(new ModelGateway({ complete: async request => {
@@ -29,6 +53,28 @@ describe('AgentRunner', () => {
     expect(plannerSystem).toContain('credential-free sources');
     expect(plannerSystem).not.toContain('Open-Meteo');
     expect(plannerSystem).not.toContain('file-specific instruction');
+  });
+
+  it('routes a desktop GitHub clone to file planning and accepts recovered git arguments', async () => {
+    let plannerSystem = '';
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      if (request.role === 'planner.route') return { data: { status: 'ready', scenario: 'desktop' },
+        usage: { inputTokens: 1, outputTokens: 1 } };
+      plannerSystem = request.system;
+      return { data: { status: 'ready', intent: 'clone repository', acceptanceCriteria: ['Clone repository'],
+        requiredCapabilities: [], steps: [
+          { id: 'mkdir', capabilityKey: 'filesystem.mkdir', description: 'Create destination',
+            dependsOn: [], input: { path: 'C:/Users/Administrator/Desktop/deepseek-code' } },
+          { id: 'clone', capabilityKey: 'process.run', description: 'Clone into destination',
+            dependsOn: ['mkdir'], input: { command: 'git', cwd: 'C:/Users/Administrator/Desktop/deepseek-code',
+              dynamicArgs: { args: { args: ['clone', 'https://github.com/deepseek-ai/deepseek-harness.git', '.'] } } } },
+        ] }, usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const plan = await runner.runPlanner({ taskId: 'clone-repository',
+      message: '把 https://github.com/deepseek-ai/deepseek-harness 拉取到桌面 deepseek-code 文件夹', attachments: [] });
+    expect(plannerSystem).toContain('To clone a public Git repository');
+    expect(plan.steps[1]?.input?.args).toEqual(['clone', '--depth', '1',
+      'https://github.com/deepseek-ai/deepseek-harness.git', '.']);
   });
 
   it('removes an unrequested saved report from a live research plan', async () => {
@@ -47,6 +93,84 @@ describe('AgentRunner', () => {
     const plan = await runner.runPlanner({ taskId: 'research', message: '调研当前 Java 岗位招聘情况', attachments: [] });
     expect(plan.steps.map(step => step.capabilityKey)).toEqual(['network.request']);
     expect(plan.acceptanceCriteria).toEqual(['Retrieve public evidence']);
+  });
+
+  it('answers a fetched page title without building a parsing tool', async () => {
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => ({
+      data: request.role === 'planner.route' ? { status: 'ready', scenario: 'web' }
+        : { status: 'ready', intent: 'read page title', acceptanceCriteria: ['Return the page title'],
+          requiredCapabilities: [{ name: 'dynamic.web.parse_html', purpose: 'Extract title', riskLevel: 'low' }],
+          steps: [
+            { id: 'fetch_page', capabilityKey: 'network.request', description: 'Fetch the page', dependsOn: [],
+              input: { url: 'https://example.com', method: 'GET' } },
+            { id: 'extract_title', capabilityKey: 'dynamic.web.parse_html',
+              description: 'Parse the HTML title', dependsOn: ['fetch_page'], input: { dynamicArgs: {} } },
+          ] }, usage: { inputTokens: 1, outputTokens: 1 },
+    }) }));
+    const plan = await runner.runPlanner({ taskId: 'page-title',
+      message: '访问 https://example.com 并告诉我网页标题', attachments: [] });
+    expect(plan.steps.map(step => step.capabilityKey)).toEqual(['network.request']);
+    expect(plan.requiredCapabilities).toEqual([]);
+  });
+
+  it('normalizes a file summary plan that uses unsupported prior-result placeholders', async () => {
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => ({
+      data: request.role === 'planner.route' ? { status: 'ready', scenario: 'files' }
+        : { status: 'ready', intent: 'summarize a local file', acceptanceCriteria: ['Save grounded summary'],
+          requiredCapabilities: [], steps: [
+            { id: 'read', capabilityKey: 'filesystem.read_text', description: 'Read notes', dependsOn: [],
+              input: { path: 'D:/demo/notes.txt' } },
+            { id: 'synthesize', capabilityKey: 'text.replace', description: 'Summarize notes', dependsOn: ['read'],
+              input: { text: '{{read.output}}', instruction: 'Summarize' } },
+            { id: 'write', capabilityKey: 'filesystem.write_text', description: 'Save the summary', dependsOn: ['synthesize'],
+              input: { path: 'D:/demo/summary.md', content: '{{synthesize.output}}' } },
+          ] }, usage: { inputTokens: 1, outputTokens: 1 },
+    }) }));
+    const plan = await runner.runPlanner({ taskId: 'file-summary',
+      message: 'Read D:/demo/notes.txt and save a summary to D:/demo/summary.md', attachments: [] });
+    expect(plan.steps.map(step => step.capabilityKey)).toEqual(['filesystem.read_text', 'filesystem.write_text']);
+    expect(plan.steps[1]?.input).toHaveProperty('generation');
+  });
+
+  it('excludes process execution from a pure word-frequency plan', async () => {
+    let plannerSchema: unknown;
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      if (request.role === 'planner.route') return { data: { status: 'ready', scenario: 'general' },
+        usage: { inputTokens: 1, outputTokens: 1 } };
+      plannerSchema = request.outputSchema;
+      return { data: { status: 'ready', intent: 'count word frequency', acceptanceCriteria: ['Count words'],
+        requiredCapabilities: [], steps: [{ id: 'count', capabilityKey: 'dynamic.text.word_frequency',
+          description: 'Count each word', dependsOn: [], input: { dynamicArgs: { text: 'apple banana apple' } } }] },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const plan = await runner.runPlanner({ taskId: 'word-frequency',
+      message: '请使用工具统计 apple banana apple 中每个单词的出现次数', attachments: [] });
+    expect(JSON.stringify(branchSchema(plannerSchema, 'ready'))).not.toContain('process.run');
+    expect(plan.steps[0]?.capabilityKey).toBe('dynamic.text.word_frequency');
+    expect(plan.steps[0]?.input).toEqual({ text: 'apple banana apple' });
+  });
+
+  it('keeps the pure-text capability restriction during a global replan', async () => {
+    let replanSchema: unknown;
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      if (request.role === 'planner.review') return { data: { action: 'replan', reason: 'Previous tool failed' },
+        usage: { inputTokens: 1, outputTokens: 1 } };
+      replanSchema = request.outputSchema;
+      return { data: { status: 'ready', intent: 'count words', acceptanceCriteria: ['Count each word'],
+        requiredCapabilities: [], steps: [{ id: 'retry_count', capabilityKey: 'dynamic.text.word_frequency',
+          description: 'Count each word', dependsOn: [], input: { dynamicArgs: { text: 'apple apple' } } }] },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const plan = { status: 'ready' as const, intent: 'count words', acceptanceCriteria: ['Count each word'],
+      requiredCapabilities: [], steps: [{ id: 'first_count', capabilityKey: 'dynamic.text.word_frequency',
+        description: 'Count each word', dependsOn: [], input: { text: 'apple apple' } }] };
+    const decision = await runner.runPlannerReview({ taskId: 'frequency-replan',
+      message: '请计算 apple apple 中每个单词的出现次数', plan, step: plan.steps[0]!, completedStepIds: [],
+      results: [], outcome: { status: 'failure', failure: { stage: 'execution', code: 'EXECUTION_ERROR',
+        reason: 'Previous tool failed', stepId: 'first_count' } }, safeToReplay: true,
+      workspaceRoot: 'D:/demo', desktopDirectory: 'D:/demo/Desktop' });
+    expect(JSON.stringify(replanSchema)).not.toContain('process.run');
+    expect(decision.action).toBe('replan');
   });
 
   it('does not permit a direct answer when routing identifies a live-data scenario', async () => {

@@ -16,6 +16,8 @@ import { sendTaskNotice } from './task-notification.js';
 import { TrajectoryView } from './TrajectoryView.js';
 import { SessionLogView } from './SessionLogView.js';
 import { AgentActivity } from './AgentActivity.js';
+import { TaskFlowDrawer, TaskFlowSummary } from './TaskFlowView.js';
+import { fetchTaskFlow, type TaskFlow } from './task-flow.js';
 import { sessionSwitchReset } from './session-switch.js';
 
 type EventItem = { type: string; payload: Record<string, unknown>; createdAt?: string };
@@ -24,7 +26,8 @@ type PendingPermission = {
   requestId: string;
   risk: 'low' | 'medium' | 'high';
   operation: { permission: string; action: string; target: string; reason: string;
-    arguments?: { command?: string; executable?: string; args?: string[]; cwd?: string | null } };
+    arguments?: { command?: string; executable?: string; args?: string[]; cwd?: string | null;
+      arguments?: Record<string, unknown> } };
 };
 type TaskPayload = {
   task: {
@@ -118,6 +121,8 @@ export function App() {
     () => typeof Notification === 'undefined' ? 'unsupported' : Notification.permission,
   );
   const [focusTaskId, setFocusTaskId] = useState<string | null>(null);
+  const [flowDrawerTaskId, setFlowDrawerTaskId] = useState<string | null>(null);
+  const [liveFlow, setLiveFlow] = useState<TaskFlow | null>(null);
 
   const [input, setInput] = useState('');
   const [files, setFiles] = useState<File[]>([]);
@@ -148,6 +153,27 @@ export function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [activeSessionId, activeView]);
   const draftProgress = task?.events.filter(event => event.type === 'draft.progress').at(-1)?.payload;
+  const latestTaskId = task?.task.id ?? legacyView ?? [...messages].reverse().find(row => row.taskId)?.taskId ?? null;
+
+  useEffect(() => {
+    const activeTaskId = task && !terminalStatuses.has(task.task.status) ? task.task.id : null;
+    if (!activeTaskId) { setLiveFlow(null); return; }
+    let disposed = false;
+    let timer: number | undefined;
+    let controller: AbortController | null = null;
+    const load = async () => {
+      controller?.abort();
+      controller = new AbortController();
+      try {
+        const next = await fetchTaskFlow(activeTaskId, controller.signal);
+        if (!disposed) setLiveFlow(next);
+      } catch { /* The main task polling reports connection errors. */ }
+      if (!disposed) timer = window.setTimeout(load, 1800);
+    };
+    setLiveFlow(null);
+    void load();
+    return () => { disposed = true; controller?.abort(); window.clearTimeout(timer); };
+  }, [task?.task.id, task?.task.status && terminalStatuses.has(task.task.status)]);
 
   useEffect(() => {
     let active = true;
@@ -219,6 +245,7 @@ export function App() {
 
   async function openSession(sessionId: string, resumeTask?: TaskPayload) {
     const reset = sessionSwitchReset();
+    setFlowDrawerTaskId(null);
     setActiveSessionId(sessionId);
     activeSessionIdRef.current = sessionId;
     setLegacyView(null);
@@ -270,6 +297,7 @@ export function App() {
   }
 
   function openLegacyTask(taskId: string, payload?: TaskPayload) {
+    setFlowDrawerTaskId(null);
     void (async () => {
       try {
         const detail = payload ?? await loadTask(taskId);
@@ -689,6 +717,14 @@ export function App() {
             <span className="header-note">多智能体工作台</span>
           </div>
           <div className="header-actions">
+            <button type="button" className="task-flow-toggle" disabled={!latestTaskId}
+              title={latestTaskId ? '查看最近一项任务的派发与执行进度' : '当前还没有任务'}
+              onClick={() => { if (latestTaskId) setFlowDrawerTaskId(latestTaskId); }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <rect x="9" y="2" width="6" height="5" rx="1"/><rect x="2" y="17" width="6" height="5" rx="1"/>
+                <rect x="16" y="17" width="6" height="5" rx="1"/><path d="M12 7v5M5 17v-5h14v5"/>
+              </svg>流程图
+            </button>
             <button type="button" className={`logs-toggle ${activeView === 'logs' ? 'is-active' : ''}`}
               aria-pressed={activeView === 'logs'} aria-label="打开智能体日志"
               title={activeSessionId || legacyView ? '查看智能体错误、警告和调用上下文' : '创建或打开会话后查看日志'}
@@ -758,6 +794,8 @@ export function App() {
                 <div className={`message-bubble ${row.taskStatus && failedStatuses.has(row.taskStatus) ? 'is-failed' : ''}`}>
                   {row.role === 'assistant' && row.sources?.length ? <AnswerSources sources={row.sources} /> : null}
                   <div className="message-text">{row.content}</div>
+                  {row.role === 'assistant' && row.taskId ? <button type="button" className="message-flow-link"
+                    onClick={() => setFlowDrawerTaskId(row.taskId!)}>查看此任务流程</button> : null}
                 </div>
               </article>
             ))}
@@ -772,6 +810,8 @@ export function App() {
                     ? <small>长篇文案已生成 {draftProgress.completed}/{draftProgress.total} 段，正在继续校验</small>
                     : null}
                   <AgentActivity events={task.events} />
+                  <TaskFlowSummary flow={liveFlow?.taskId === task.task.id ? liveFlow : null}
+                    onOpen={() => setFlowDrawerTaskId(task.task.id)} />
                   {activeSources.length > 0 ? <AnswerSources sources={activeSources} /> : null}
                 </div>
               </article>
@@ -798,6 +838,10 @@ export function App() {
                       cwd={task.task.pendingPermission.operation.arguments?.cwd}
                       launch={task.task.pendingPermission.operation.action === 'launch'}
                     />
+                  ) : null}
+                  {task.task.pendingPermission.operation.permission === 'mcp' ? (
+                    <div><dt>工具参数</dt><dd className="approval-target"><pre>{JSON.stringify(
+                      task.task.pendingPermission.operation.arguments?.arguments ?? {}, null, 2)}</pre></dd></div>
                   ) : null}
                   <div><dt>原因</dt><dd>{task.task.pendingPermission.operation.reason}</dd></div>
                 </dl>
@@ -929,6 +973,7 @@ export function App() {
           </div>
         </form> : null}
       </section>
+      {flowDrawerTaskId ? <TaskFlowDrawer taskId={flowDrawerTaskId} onClose={() => setFlowDrawerTaskId(null)} /> : null}
     </main>
   );
 }
@@ -941,13 +986,13 @@ function readPermissionMode(): PermissionMode {
 function permissionLabel(permission: string): string {
   return ({
     'filesystem.read': '读取文件', 'filesystem.write': '写入文件', network: '网络访问',
-    process: '启动进程', location: '获取位置',
+    process: '启动进程', location: '获取位置', mcp: 'MCP 工具调用',
   } as Record<string, string>)[permission] ?? permission;
 }
 
 function actionLabel(action: string): string {
   return ({ mkdir: '创建目录', create_directory: '创建目录', writeText: '写入文件', write_text: '写入文件',
-    readText: '读取文件', read_text: '读取文件', remove: '删除文件', request: '发送网络请求', run: '执行短命令', launch: '启动应用', current: '获取设备位置' } as Record<string, string>)[action] ?? action;
+    readText: '读取文件', read_text: '读取文件', remove: '删除文件', request: '发送网络请求', run: '执行短命令', launch: '启动应用', current: '获取设备位置', call: '调用 MCP 工具' } as Record<string, string>)[action] ?? action;
 }
 
 function riskLabel(risk: PendingPermission['risk']): string {

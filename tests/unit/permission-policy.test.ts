@@ -58,6 +58,9 @@ describe('PermissionPolicy', () => {
     ['process launch in auto', 'auto', () => operation({ permission: 'process', action: 'run', target: 'node.exe' }), {}, 'require_approval'],
     ['GUI launch in full', 'full', () => operation({ permission: 'process', action: 'launch', target: 'C:\\Apps\\cloudmusic.exe' }), {}, 'allow'],
     ['location lookup in auto', 'auto', () => operation({ permission: 'location', action: 'current', target: 'device location' }), {}, 'require_approval'],
+    ['MCP call in request', 'request', () => operation({ permission: 'mcp', action: 'call', target: 'memory/search_nodes' }), {}, 'require_approval'],
+    ['MCP call in auto', 'auto', () => operation({ permission: 'mcp', action: 'call', target: 'memory/search_nodes' }), {}, 'require_approval'],
+    ['MCP call in full', 'full', () => operation({ permission: 'mcp', action: 'call', target: 'memory/search_nodes' }), {}, 'allow'],
     ['all supported operations in full', 'full', () => operation({ permission: 'process', action: 'run', target: 'node.exe' }), {}, 'allow'],
     ['unknown operation fails closed', 'auto', () => operation({ action: 'mystery' }), {}, 'require_approval'],
   ] as Array<[string, PermissionMode, (root: string) => PermissionOperation, Partial<PermissionContext>, string]>)('%s', (name, mode, makeOperation, contextOverrides, expected) => {

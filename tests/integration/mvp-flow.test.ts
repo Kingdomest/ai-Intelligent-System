@@ -19,11 +19,17 @@ describe('Jarvis MVP flow', () => {
     const directory = mkdtempSync(join(tmpdir(), 'jarvis-mvp-'));
     temporaryDirectories.push(directory);
     const runtime = createDependencies({ dataDir: directory, modelMode: 'mock' });
-
+    try {
     const first = await runtime.taskService.createAndWait({
       message: '统计上传内容有多少行',
       attachments: [{ id: 'one', filename: 'one.txt', mimeType: 'text/plain', size: 4, content: 'a\nb\n' }],
     });
+    const team = runtime.a2aProtocol.listAgents(first.id);
+    const main = team.find(agent => agent.role === 'orchestrator')!;
+    const worker = team.find(agent => agent.role === 'task-worker-0')!;
+    expect(worker.parentAgentId).toBe(main.id);
+    expect(runtime.a2aProtocol.listInbox(main.id).some(message => message.type === 'artifact'
+      && (message.payload as { kind?: string }).kind === 'step.result')).toBe(true);
     const second = await runtime.taskService.createAndWait({
       message: '统计上传内容有多少行',
       attachments: [{ id: 'two', filename: 'two.txt', mimeType: 'text/plain', size: 6, content: 'a\nb\nc\n' }],
@@ -38,8 +44,11 @@ describe('Jarvis MVP flow', () => {
     expect(runtime.store.listActiveCapabilities().every((capability) =>
       capability.manifest.provenance.sourceTaskId === 'builtin')).toBe(true);
     expect((runtime.modelProvider as { calls?: number }).calls).toBeGreaterThan(0);
-    runtime.store.close();
-  });
+    } finally {
+      await runtime.mcp.close();
+      runtime.store.close();
+    }
+  }, 20_000);
 
   it('rejects an unsafe generated candidate before sandbox execution', () => {
     const candidate = {

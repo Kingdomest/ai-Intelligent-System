@@ -1,10 +1,10 @@
 import type { AgentRunner, PlannerDecision, PlannerInput, ResponseInput, StepReviewInput } from '../agents/agent-runner.js';
-import type { TestAgent, TestReport } from '../agents/test-agent.js';
+import type { TestAgent, TestPlan, TestReport } from '../agents/test-agent.js';
 import { CapabilityRegistry } from '../capabilities/registry.js';
 import { getBuiltin } from '../capabilities/builtin-catalog.js';
 import { SandboxRunner } from '../capabilities/sandbox-runner.js';
 import { ToolFactory } from '../capabilities/tool-factory.js';
-import type { ExecutionCheckpoint, PermissionOperation, StepBinding, TaskEvent, TaskRun } from '../domain/contracts.js';
+import type { ExecutionCheckpoint, PermissionOperation, StepBinding, StepVerificationEvidence, TaskEvent, TaskRun } from '../domain/contracts.js';
 import type { CorrectionFailure } from '../domain/contracts.js';
 import { ApprovalRequiredError, CapabilityUnavailableError, HostOperationError, OperationUncertainError, PermissionBroker, PermissionDeniedError } from '../permissions/permission-broker.js';
 import type { HostCallResult } from '../permissions/operation-protocol.js';
@@ -25,9 +25,12 @@ import { isNewsSearchUrl, parseNewsRss } from '../research/news-rss.js';
 import type { SessionMemorySnapshot } from '../domain/contracts.js';
 import { parsePlannerDecision, validateStepInput } from '../agents/planner-contract.js';
 import { compactVerifiedResult } from '../agents/step-review-context.js';
+import type { DelegationOptions, TaskCollaborationRuntime } from './task-collaboration.js';
+import type { ToolDiscovery, ToolOption } from '../capabilities/tool-discovery.js';
+import { inspectGitDestination, routineGitClone } from './git-clone-contract.js';
 
 export type AgentServices = Pick<AgentRunner, 'runPlanner' | 'runEvaluator' | 'runImplementer'>
-  & Partial<Pick<AgentRunner, 'runResponder' | 'runCorrection' | 'runDraftCorrection' | 'runFileImplementer' | 'runStepRepair' | 'runPlannerReview'>>;
+  & Partial<Pick<AgentRunner, 'runResponder' | 'runCorrection' | 'runDraftCorrection' | 'runFileImplementer' | 'runStepRepair' | 'runPlannerReview' | 'runToolSearch' | 'runToolSelection'>>;
 
 class StepReviewRequiredError extends Error {
   constructor(readonly failure: CorrectionFailure, readonly safeToReplay: boolean,
@@ -49,9 +52,11 @@ export interface AgentLoopDependencies {
   desktopObserver: WindowsDesktopObserver;
   factory: ToolFactory;
   registry: CapabilityRegistry;
+  toolDiscovery?: ToolDiscovery;
   sandbox: SandboxRunner;
   budget: BudgetManager;
   scheduler: AdaptiveScheduler;
+  collaboration?: TaskCollaborationRuntime;
   maxRetries: number;
   maxSteps: number;
   permissionBroker?: PermissionBroker;
@@ -226,6 +231,11 @@ export class AgentLoop {
         return this.block(task, '文件读取后缺少回答 Agent，无法可靠生成总结；任务未继续执行。');
       }
 
+      const dispatched = this.dependencies.collaboration?.ensurePlan(task.id, planner.steps, stepResults,
+        this.delegationOptions(task.id, planner, stepBindings));
+      if (dispatched) this.event(task, 'team.dispatched', {
+        workerCount: dispatched.workerCount, assignedSteps: planner.steps.length,
+        planVersion: dispatched.planVersion, stepIds: planner.steps.map(step => step.id) });
       this.setStatus(task, 'PLAN_READY');
       while (executedSteps < this.dependencies.maxSteps || task.executionCheckpoint?.pendingReview) {
         const pending = task.executionCheckpoint?.pendingReview;
@@ -244,6 +254,7 @@ export class AgentLoop {
             outcome: pending.outcome === 'failure'
               ? { status: 'failure', failure: sanitizeCorrectionFailure(pending.failure!), output: pending.output }
               : { status: 'success', output: pending.output ?? stepResults.find(result => result.stepId === pending.stepId)?.output },
+            verification: pending.verification,
             safeToReplay: pending.safeToReplay, workspaceRoot, desktopDirectory,
           };
           let decision: Awaited<ReturnType<NonNullable<AgentServices['runPlannerReview']>>>;
@@ -255,6 +266,7 @@ export class AgentLoop {
           }
           this.event(task, 'plan.reviewed', { stepId: pending.stepId, outcome: pending.outcome,
             action: decision.action });
+          this.dependencies.collaboration?.reviewStep(task.id, planner.steps, pending.stepId, decision.action);
           if (decision.action === 'block') {
             if (pending.failure) this.finishActiveRound(task, pending.failure);
             return this.block(task, decision.reason);
@@ -288,6 +300,11 @@ export class AgentLoop {
           if (!adopted) return this.dependencies.store.getTask(task.id) ?? task;
           planner = adopted.planner;
           stepBindings = adopted.bindings;
+          const reassigned = this.dependencies.collaboration?.ensurePlan(task.id, planner.steps, stepResults,
+            this.delegationOptions(task.id, planner, stepBindings));
+          if (reassigned) this.event(task, 'team.dispatched', {
+            workerCount: reassigned.workerCount, assignedSteps: planner.steps.length,
+            planVersion: reassigned.planVersion, stepIds: planner.steps.map(step => step.id) });
           continue;
         }
         const nextStep = this.dependencies.scheduler.nextReadyStep(planner, completedSteps);
@@ -308,8 +325,12 @@ export class AgentLoop {
           currentStepId: nextStep.id,
           operationSequence: checkpoint?.currentStepId === nextStep.id ? checkpoint.operationSequence : 0,
         };
+        const peerResults = this.dependencies.collaboration?.beginStep(task.id, planner.steps, nextStep.id, stepResults) ?? {};
         if (nextStep.capabilityKey === 'filesystem.write_text' && nextStep.input?.generation
           && !await this.implementPlannedFiles(task, planner, completedSteps, stepResults, nextStep.id)) {
+          if (task.executionCheckpoint.pendingReview) {
+            this.dependencies.collaboration?.failStep(task.id, planner.steps, nextStep.id, 'FILE_IMPLEMENTATION_FAILED');
+          }
           if (task.executionCheckpoint.pendingReview) continue;
           return this.dependencies.store.getTask(task.id) ?? task;
         }
@@ -317,14 +338,14 @@ export class AgentLoop {
         this.setStatus(task, 'EXECUTING');
         const stepStarted = Date.now();
         this.event(task, 'step.started', { stepId: nextStep.id, capability: capability.id, version: capability.version });
-        let result: { completed: boolean; output?: unknown } | undefined;
+        let result: { completed: boolean; output?: unknown; verification?: StepVerificationEvidence } | undefined;
         let reviewFailure: StepReviewRequiredError | undefined;
         try {
           result = await this.executeStep(
             task,
             capability.id,
             capability.version,
-            withExecutionInput(runtimeInput, nextStep.input),
+            withExecutionInput({ ...runtimeInput, peerResults }, nextStep.input),
             planner,
             capability.manifest.permissions,
           );
@@ -340,6 +361,8 @@ export class AgentLoop {
           this.event(task, waitingForApproval ? 'step.paused' : 'step.failed', { stepId: nextStep.id,
             capability: capability.id, version: capability.version, durationMs: Date.now() - stepStarted,
             failureCode: waitingForApproval ? undefined : reviewFailure?.failure.code ?? errorCode(error) });
+          if (!waitingForApproval) this.dependencies.collaboration?.failStep(task.id, planner.steps,
+            nextStep.id, reviewFailure?.failure.code ?? errorCode(error));
           if (!reviewFailure) throw error;
         }
         if (!reviewFailure && !result?.completed) {
@@ -349,8 +372,10 @@ export class AgentLoop {
         }
         this.throwIfCancelled(task);
         if (!reviewFailure) {
+          const observation = { stepId: nextStep.id, output: result!.output, observedAt: new Date().toISOString() };
+          this.dependencies.collaboration?.completeStep(task.id, planner.steps, observation);
           lastOutput = result!.output;
-          stepResults.push({ stepId: nextStep.id, output: result!.output, observedAt: new Date().toISOString() });
+          stepResults.push(observation);
           completedSteps.add(nextStep.id);
           if (capability.status === 'canary') {
             this.dependencies.registry.promote(capability.id, capability.version, task.id);
@@ -360,7 +385,7 @@ export class AgentLoop {
           task.executionCheckpoint.stepResults = stepResults;
           if (this.dependencies.agents.runPlannerReview) {
             task.executionCheckpoint.pendingReview = { stepId: nextStep.id, outcome: 'success',
-              safeToReplay: true };
+              verification: result!.verification, safeToReplay: true };
           }
           this.save(task);
           this.event(task, 'step.completed', { stepId: nextStep.id, capability: capability.id,
@@ -405,7 +430,17 @@ export class AgentLoop {
         }
         return await this.completeAnswer(task, planner, results);
       } else {
-        task.result = formatResult(lastOutput);
+        const checkouts = planner.steps.filter(step => step.capabilityKey === 'process.run')
+          .map(step => routineGitClone(step.input ?? {})).filter((item): item is NonNullable<typeof item> => item !== null);
+        const existingSource = lastOutput && typeof lastOutput === 'object'
+          ? lastOutput as { alreadyPresent?: unknown; source?: unknown } : {};
+        task.result = checkouts.length === 1 && existingSource.alreadyPresent === true
+          ? existingSource.source === 'github-source-archive'
+            ? `目标目录 ${checkouts[0]!.directory} 已有该仓库源码归档；未重复克隆，目录不含 Git 历史。`
+            : `目标目录 ${checkouts[0]!.directory} 已有对应的 Git 仓库；未重复克隆。`
+          : checkouts.length === 1
+            ? `已将仓库拉取到 ${checkouts[0]!.directory}。`
+          : formatResult(lastOutput);
       }
       this.finishActiveRound(task);
       task.executionCheckpoint = undefined;
@@ -449,7 +484,7 @@ export class AgentLoop {
     for (const stepId of completed) {
       const before = previous.steps.find(step => step.id === stepId);
       const after = proposed.steps.find(step => step.id === stepId);
-      if (!before || !after || !isDeepStrictEqual(before, after)) {
+      if (!before || !after || !isDeepStrictEqual(planStepSemantics(before), planStepSemantics(after))) {
         this.block(task, `全局重规划修改了已验证步骤 ${stepId}，已拒绝新计划。`);
         return null;
       }
@@ -477,7 +512,9 @@ export class AgentLoop {
       && step.capabilityKey === attemptedStep.capabilityKey
       && isDeepStrictEqual(step.input, attemptedStep.input));
     if (repeated) {
-      this.block(task, `全局重规划仍会重复步骤 ${attemptedStep.id} 的同一操作，已拒绝新计划。`);
+      const failure = task.executionCheckpoint?.pendingReview?.failure;
+      const cause = failure ? ` 原错误：${sanitizeCorrectionFailure(failure).reason}` : '';
+      this.block(task, `全局重规划仍会重复步骤 ${attemptedStep.id} 的同一操作，已拒绝新计划。${cause}`);
       return null;
     }
     if (!safeToReplay) {
@@ -566,6 +603,7 @@ export class AgentLoop {
             onResearch: sources => this.event(task, 'research.searched', {
               sourceCount: sources.length, sources: sanitizeAnswerSources(sources) }) });
           if (!content.trim()) throw new Error('文件实施 Agent 返回了空内容。');
+          step.assignmentInput ??= plannedInput;
           step.input = { path, content };
           previousFiles.push({ path, content });
           this.event(task, 'file.implemented', { stepId: step.id });
@@ -632,6 +670,18 @@ export class AgentLoop {
       this.event(task, 'task.completed', { reason: 'answer-direct' });
       return task;
     }
+    // A single verified read-only lookup has already been reviewed by the planner.
+    // Routine questions need an answer, not another tester/evaluator round trip.
+    if (isRoutineLookupAnswer(task.message, planner, results)) {
+      if (!answer?.trim()) return this.block(task, '回答 Agent 未给出有效回答，已验证的查询结果仍保留。');
+      task.result = answer;
+      task.executionCheckpoint = undefined;
+      this.finishActiveRound(task);
+      this.emitAnswerSources(task, results);
+      this.setStatus(task, 'COMPLETED');
+      this.event(task, 'task.completed', { reason: 'answer-routine-lookup' });
+      return task;
+    }
     for (;;) {
       this.setStatus(task, 'TEST_REVIEW');
       const round = task.correctionState.currentRound;
@@ -690,18 +740,7 @@ export class AgentLoop {
       if (passed) {
         task.result = answer;
         task.executionCheckpoint = undefined;
-        const sources = sanitizeAnswerSources(results.flatMap(result => {
-          const response = result.output && typeof result.output === 'object'
-            ? result.output as { articles?: unknown } : {};
-          return [
-            ...(result.sourceUrl ? [{ title: '', url: result.sourceUrl }] : []),
-            ...(Array.isArray(response.articles) ? response.articles.map(article => {
-              const item = article && typeof article === 'object' ? article as Record<string, unknown> : {};
-              return { title: item.title, url: item.url };
-            }) : []),
-          ];
-        }));
-        if (sources.length) this.event(task, 'answer.sources', { sources });
+        this.emitAnswerSources(task, results);
         this.setStatus(task, 'COMPLETED');
         this.event(task, 'task.completed', { reason: 'answer' });
         return task;
@@ -748,8 +787,104 @@ export class AgentLoop {
     }
   }
 
+  private emitAnswerSources(task: TaskRun,
+    results: Array<{ stepId: string; sourceUrl?: string; output: unknown; observedAt: string }>): void {
+    const sources = sanitizeAnswerSources(results.flatMap(result => {
+      const response = result.output && typeof result.output === 'object'
+        ? result.output as { articles?: unknown } : {};
+      return [
+        ...(result.sourceUrl ? [{ title: '', url: result.sourceUrl }] : []),
+        ...(Array.isArray(response.articles) ? response.articles.map(article => {
+          const item = article && typeof article === 'object' ? article as Record<string, unknown> : {};
+          return { title: item.title, url: item.url };
+        }) : []),
+      ];
+    }));
+    if (sources.length) this.event(task, 'answer.sources', { sources });
+  }
+
+  private async selectStepTool(task: TaskRun, planner: PlannerDecision, step: PlannerDecision['steps'][number]): Promise<void> {
+    const key = step.capabilityKey ?? '';
+    if (!key.startsWith('dynamic.') || !this.dependencies.toolDiscovery
+      || this.dependencies.registry.findUsableByKey(key, task.id)) return;
+    const required = planner.requiredCapabilities.find(item => item.name === key);
+    const purpose = required?.purpose ?? step.description;
+    const workerRole = this.dependencies.collaboration?.assignedWorkerRole(task.id, planner.steps, step.id);
+    let queries = [purpose, step.description];
+    if (this.dependencies.agents.runToolSearch) {
+      try {
+        queries = await this.dependencies.agents.runToolSearch({ taskId: task.id,
+          description: step.description, purpose, capabilityKey: key, workerRole });
+      } catch { /* The step description still supplies a bounded local search. */ }
+    }
+    const found = await Promise.all(queries.slice(0, 3).map(query =>
+      this.dependencies.toolDiscovery!.search(query.slice(0, 500), 8).catch(() => [])));
+    const candidates = [...new Map(found.flat().filter(item => item.id !== 'builtin:process.launch')
+      .map(item => [item.id, item])).values()]
+      .sort((left, right) => (right.score ?? 0) - (left.score ?? 0)).slice(0, 8);
+    this.event(task, 'tool.searched', { stepId: step.id, candidateCount: candidates.length,
+      workerRole, queryCount: queries.length });
+    if (!candidates.length || !this.dependencies.agents.runToolSelection) {
+      this.event(task, 'tool.selected', { stepId: step.id, choice: 'create', workerRole });
+      return;
+    }
+    try {
+      const decision = await this.dependencies.agents.runToolSelection({ taskId: task.id,
+        description: step.description, purpose, capabilityKey: key, workerRole,
+        stepInput: step.input ?? {}, candidates });
+      if (decision.action === 'create') {
+        this.event(task, 'tool.selected', { stepId: step.id, choice: 'create', workerRole });
+        return;
+      }
+      const selected = candidates.find(item => item.id === decision.toolId);
+      if (!selected || !decision.arguments) throw new Error('Selected tool or arguments are unavailable.');
+      const selectedInput = this.toolInput(selected, decision.arguments);
+      step.capabilityKey = selected.source === 'builtin' ? selected.name : 'mcp.call';
+      step.input = selectedInput;
+      if (selected.source === 'mcp') (step as typeof step & { mcpInputSchema?: unknown }).mcpInputSchema = selected.inputSchema;
+      this.event(task, 'tool.selected', { stepId: step.id, choice: selected.source,
+        tool: selected.name, server: selected.server, workerRole });
+    } catch {
+      this.event(task, 'tool.selected', { stepId: step.id, choice: 'create', workerRole,
+        reason: 'selection-unavailable' });
+    }
+  }
+
+  private toolInput(option: ToolOption, args: Record<string, unknown>): Record<string, unknown> {
+    if (JSON.stringify(args).length > 20_000) throw new Error('Tool arguments exceed the selection limit.');
+    if (option.source === 'builtin') return validateStepInput(option.name, args);
+    if (!option.server) throw new Error('MCP tool has no server.');
+    const schema = option.inputSchema && typeof option.inputSchema === 'object'
+      ? option.inputSchema as { required?: unknown; properties?: Record<string, { type?: unknown }> } : {};
+    for (const name of Array.isArray(schema.required) ? schema.required : []) {
+      if (typeof name === 'string' && !(name in args)) throw new Error(`MCP tool argument is missing: ${name}`);
+    }
+    for (const [name, value] of Object.entries(args)) {
+      const type = schema.properties?.[name]?.type;
+      if (typeof type === 'string' && type !== 'null' && (type === 'array' ? !Array.isArray(value)
+        : type === 'object' ? !value || typeof value !== 'object' || Array.isArray(value)
+          : typeof value !== type)) throw new Error(`MCP tool argument has wrong type: ${name}`);
+    }
+    return { server: option.server, tool: option.name, dynamicArgs: args };
+  }
+
+  private delegationOptions(taskId: string, planner: PlannerDecision, bindings: StepBinding[]): DelegationOptions {
+    const schemas: NonNullable<DelegationOptions['schemas']> = {};
+    for (const binding of bindings) {
+      const step = planner.steps.find(item => item.id === binding.stepId);
+      if (step) (step as typeof step & { assignmentCapabilityKey?: string }).assignmentCapabilityKey = binding.capabilityKey;
+      const capability = this.dependencies.registry.getVersion(binding.capabilityId, binding.version, taskId);
+      if (!capability) continue;
+      schemas[binding.stepId] = { version: binding.version,
+        inputSchema: capability.manifest.inputSchema, outputSchema: capability.manifest.outputSchema };
+    }
+    return { acceptanceCriteria: planner.acceptanceCriteria, schemas };
+  }
+
   private async ensureCapabilities(task: TaskRun, planner: PlannerDecision, runtimeInput: Record<string, unknown>,
     completed = new Set<string>(), existingBindings: StepBinding[] = []): Promise<CapabilityOutcome> {
+    const unbound = planner.steps.find(step => !step.capabilityKey && planner.requiredCapabilities.length !== 1);
+    if (unbound) return { state: 'failed', message: `步骤 ${unbound.id} 没有明确能力键，无法安全绑定工具。` };
     const bindings: StepBinding[] = [];
     for (const step of planner.steps) {
       if (completed.has(step.id)) {
@@ -758,6 +893,7 @@ export class AgentLoop {
         bindings.push(binding);
         continue;
       }
+      await this.selectStepTool(task, planner, step);
       const key = step.capabilityKey ?? (planner.requiredCapabilities.length === 1 ? planner.requiredCapabilities[0]!.name : '');
       if (!key) return { state: 'failed', message: `步骤 ${step.id} 没有明确能力键，无法安全绑定工具。` };
       const required = planner.requiredCapabilities.find((item) => item.name === key)
@@ -783,8 +919,11 @@ export class AgentLoop {
         }
         if (!dryRunFailure) {
           try {
-            await this.verifySandbox(task, existing.id, existing.code, existing.manifest.permissions,
-              withExecutionInput(runtimeInput, executionInput), planner.acceptanceCriteria);
+            if (!isRoutineHostBuiltin(key, existing.code, executionInput)) {
+              await this.verifySandbox(task, existing.id, existing.code, existing.manifest.permissions,
+                withExecutionInput(runtimeInput, executionInput), planner.acceptanceCriteria,
+                existing.manifest.inputSchema, existing.manifest.outputSchema);
+            }
           } catch {
             return { state: 'blocked', message: `已保存能力 ${existing.id}@${existing.version} 的测试未完成；不能据此判定工具有缺陷。` };
           }
@@ -835,6 +974,7 @@ export class AgentLoop {
             },
             feedback: task.correctionState.currentRound ? latestFailure : previousToolFailure,
             permissionMode: task.permissionMode,
+            workerRole: this.dependencies.collaboration?.assignedWorkerRole(task.id, planner.steps, step.id),
             onResearch: sources => this.event(task, 'research.searched', {
               sourceCount: sources.length, sources: sanitizeAnswerSources(sources) }),
           });
@@ -846,7 +986,8 @@ export class AgentLoop {
             if (!genericity.passed) throw new Error(`Cross-input genericity test failed: ${genericity.reason}`);
           }
           await this.verifySandbox(task, candidate.name, candidate.code, candidate.permissions,
-            withExecutionInput(runtimeInput, executionInput), planner.acceptanceCriteria);
+            withExecutionInput(runtimeInput, executionInput), planner.acceptanceCriteria,
+            candidate.inputSchema, candidate.outputSchema);
           const evaluation = await this.dependencies.agents.runEvaluator({
             taskId: task.id,
             target: candidate.name,
@@ -885,9 +1026,11 @@ export class AgentLoop {
   }
 
   private async verifySandbox(task: TaskRun, name: string, code: string, permissions: import('../domain/contracts.js').CapabilityPermission[],
-    input: Record<string, unknown>, acceptanceCriteria: string[]): Promise<void> {
+    input: Record<string, unknown>, acceptanceCriteria: string[], inputSchema?: unknown, outputSchema?: unknown): Promise<void> {
     this.setStatus(task, 'TEST_PLANNING');
-    const plan = await this.dependencies.tester.generate(task.id, { name, permissions, executionInput: input, acceptanceCriteria });
+    const plan = await this.dependencies.tester.generate(task.id, {
+      name, permissions, executionInput: input, acceptanceCriteria, inputSchema, outputSchema,
+    });
     this.setStatus(task, 'TESTING_SANDBOX');
     const report = await this.dependencies.testExecutor.runSandbox(code, plan, input);
     this.report(task, report);
@@ -908,15 +1051,41 @@ export class AgentLoop {
     input: unknown,
     planner: PlannerDecision,
     permissions: import('../domain/contracts.js').CapabilityPermission[],
-  ): Promise<{ completed: boolean; output?: unknown }> {
+  ): Promise<{ completed: boolean; output?: unknown; verification?: StepVerificationEvidence }> {
     let latestFailure = '执行未通过评估。';
     let cachedHostOutcome: { inputSignature: string; output: unknown; report: TestReport } | undefined;
+    const verifiedResult = (output: unknown) => ({ completed: true, output,
+      verification: cachedHostOutcome ? compactStepVerification(cachedHostOutcome.report) : undefined });
     for (;;) {
       try {
         let verifiedMaintainedOperation = false;
         const checkpoint = task.executionCheckpoint;
         const inputSignature = JSON.stringify(input);
         const reuseVerifiedHostOutcome = permissions.length > 0 && cachedHostOutcome?.inputSignature === inputSignature;
+        if (capabilityName === 'process.run' && input && typeof input === 'object' && !Array.isArray(input)) {
+          const destination = await inspectGitDestination(input as Record<string, unknown>);
+          if (destination?.status === 'matching') {
+            if (destination.source === 'github-source-archive'
+              && /(?:完整历史|全部提交|完整仓库历史|full history|all commits|git clone)/i.test(task.message)) {
+              throw new StepReviewRequiredError({ stage: 'execution', code: 'GIT_HISTORY_REQUIRED',
+                reason: '目标目录已有源码归档，但没有 Git 历史；不会将归档冒充为完整克隆。',
+                stepId: task.currentStepId, capabilityId: capabilityName, version: capabilityVersion },
+              false, { directory: destination.directory, source: destination.source });
+            }
+            const output = { repositoryUrl: destination.remote, path: destination.directory,
+              alreadyPresent: true, source: destination.source, gitHistory: destination.source === 'git' };
+            this.event(task, 'step.verified', { stepId: task.currentStepId, source: 'existing_repository' });
+            return { completed: true, output, verification: { mode: 'live_observation', passed: 1,
+              failed: 0, blocked: 0, checks: [{ id: 'existing-repository', status: 'passed',
+                codes: ['EXISTING_SOURCE_CONFIRMED'] }] } };
+          }
+          if (destination?.status === 'conflict') {
+            throw new StepReviewRequiredError({ stage: 'execution', code: 'DESTINATION_NOT_EMPTY',
+              reason: `目标目录 ${destination.directory} 已有其他内容；不会自动清空或覆盖。`,
+              stepId: task.currentStepId, capabilityId: capabilityName, version: capabilityVersion },
+            false, { directory: destination.directory, entries: destination.entries });
+          }
+        }
         const output = reuseVerifiedHostOutcome ? cachedHostOutcome!.output : await this.dependencies.registry.callTool(capabilityName, input, {
           taskId: task.id,
           mode: task.permissionMode,
@@ -948,6 +1117,44 @@ export class AgentLoop {
             }
           },
         });
+        const boundCapability = this.dependencies.registry.getVersion(capabilityName, capabilityVersion, task.id);
+        if (boundCapability?.manifest.provenance.sourceTaskId === 'builtin'
+          && isRoutineHostBuiltin(capabilityName, boundCapability.code,
+            input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {})) {
+          const applicationId = (input as Record<string, unknown>).applicationId;
+          const launch = capabilityName === 'process.launch';
+          if (launch && (typeof applicationId !== 'string' || !applicationId.trim())) {
+            throw new StepReviewRequiredError({ stage: 'execution', code: 'APPLICATION_ID_MISSING',
+              reason: '启动步骤缺少可观察的应用标识。', stepId: task.currentStepId }, false, output);
+          }
+          const observationPlan: Pick<TestPlan, 'cases'> = { cases: launch ? [{ id: 'desktop', mode: 'live_observation',
+            assertions: [
+              { type: 'process_running', applicationId: applicationId as string },
+              { type: 'window_visible', applicationId: applicationId as string },
+              { type: 'foreground_window', applicationId: applicationId as string },
+            ] }] : [] };
+          const expectedTarget = capabilityName === 'filesystem.read_text'
+            ? (input as Record<string, unknown>).path : undefined;
+          const report = await this.dependencies.testExecutor.runLive(this.dependencies.store, task.id,
+            task.currentStepId ?? 'unknown', capabilityVersion, permissions, observationPlan,
+            this.dependencies.desktopObserver, launch ? applicationId as string : undefined,
+            typeof expectedTarget === 'string' ? expectedTarget : undefined, checkpoint?.operationSequence ?? 0);
+          if (report.failed || report.blocked || report.passed === 0
+            || launch && !report.cases.some(item => item.id === 'desktop' && item.status === 'passed')) {
+            const reason = report.cases.flatMap(item => item.codes).join(', ') || '宿主操作状态无法确认';
+            if (this.dependencies.agents.runPlannerReview) {
+              throw new StepReviewRequiredError({ stage: 'execution', code: launch
+                ? 'DESKTOP_VERIFICATION_FAILED' : 'HOST_VERIFICATION_FAILED', reason,
+              stepId: task.currentStepId, capabilityId: capabilityName, version: capabilityVersion },
+              this.safeToRetry(task, capabilityVersion), output);
+            }
+            this.block(task, `操作后的状态核验未通过：${reason}`);
+            return { completed: false };
+          }
+          cachedHostOutcome = { inputSignature, output, report };
+          this.event(task, 'step.verified', { stepId: task.currentStepId, source: 'live_postcondition' });
+          return verifiedResult(output);
+        }
         if (permissions.length > 0) {
           this.setStatus(task, 'TEST_PLANNING');
           let plan: Awaited<ReturnType<TestAgent['generate']>>;
@@ -1036,7 +1243,7 @@ export class AgentLoop {
               || (maintainedPresentation && typeof response?.path === 'string'
                 && typeof response?.slideCount === 'number' && typeof response?.sha256 === 'string'))) {
             // The user-facing answer has an independent final evaluation.
-            return { completed: true, output };
+            return verifiedResult(output);
           }
         }
         this.setStatus(task, 'EVALUATING');
@@ -1062,10 +1269,10 @@ export class AgentLoop {
           if (!verifiedMaintainedOperation) throw error;
           this.event(task, 'step.verified', { stepId: task.currentStepId, source: 'live_postcondition',
             evaluator: 'unavailable' });
-          return { completed: true, output };
+          return verifiedResult(output);
         }
         if (evaluation.status === 'pass') {
-          return { completed: true, output };
+          return verifiedResult(output);
         }
         if (verifiedMaintainedOperation && evaluation.status !== 'wait_approval') {
           // The evaluator only receives the operation's return object, not an
@@ -1073,7 +1280,7 @@ export class AgentLoop {
           // postcondition or demand that later steps already be complete.
           this.event(task, 'step.verified', { stepId: task.currentStepId, source: 'live_postcondition',
             evaluator: 'conflicted', failureCode: evaluation.failures[0]?.code ?? 'EVALUATION_CONFLICT' });
-          return { completed: true, output };
+          return verifiedResult(output);
         }
         if (evaluation.status === 'wait_approval') {
           latestFailure = '评估器请求了审批，但没有具体宿主操作可授权。';
@@ -1577,11 +1784,18 @@ function withExecutionInput(runtimeInput: Record<string, unknown>, executionInpu
     attachments: runtimeInput.attachments,
     workspaceRoot: runtimeInput.workspaceRoot,
     desktopDirectory: runtimeInput.desktopDirectory,
+    ...(runtimeInput.peerResults !== undefined ? { peerResults: runtimeInput.peerResults } : {}),
   };
 }
 
 function isTerminal(status: TaskRun['status']): boolean {
   return status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED' || status === 'BLOCKED';
+}
+
+function planStepSemantics(step: PlannerDecision['steps'][number]): Record<string, unknown> {
+  const { assignmentCapabilityKey: _assignmentCapabilityKey, mcpInputSchema: _mcpInputSchema, ...semantic } = step as
+    typeof step & { assignmentCapabilityKey?: string; mcpInputSchema?: unknown };
+  return semantic;
 }
 
 function isMaintainedNetwork(name: string, code: string, permissions: import('../domain/contracts.js').CapabilityPermission[]): boolean {
@@ -1607,9 +1821,28 @@ function isMaintainedBuiltin(name: string, code: string): boolean {
   return builtin !== null && builtin.code === code;
 }
 
+function isRoutineHostBuiltin(name: string, code: string, input: Record<string, unknown>): boolean {
+  return (['process.launch', 'network.request', 'filesystem.read_text', 'location.current'].includes(name)
+      || name === 'process.run' && routineGitClone(input) !== null)
+    && (name !== 'network.request' || isReadOnlyDiagnostic(name, input))
+    && isMaintainedBuiltin(name, code);
+}
+
+function isRoutineLookupAnswer(message: string, planner: PlannerDecision,
+  results: Array<{ stepId: string; sourceUrl?: string; output: unknown; observedAt: string }>): boolean {
+  if (planner.status !== 'ready' || planner.steps.length !== 1 || results.length !== 1) return false;
+  const step = planner.steps[0]!;
+  if (results[0]?.stepId !== step.id || !step.capabilityKey
+    || !['network.request', 'location.current'].includes(step.capabilityKey)
+    || !isReadOnlyDiagnostic(step.capabilityKey, step.input ?? {})) return false;
+  if (/(调研|研究|报告|分析|审查|评估|比较|对比|详细|深入|严谨|高质量|research|report|analy[sz]e|review|evaluat|compar)/i.test(message)) return false;
+  const output = results[0]?.output;
+  return !(output && typeof output === 'object' && 'articles' in output);
+}
+
 function needsGroundedResponse(capabilityKey: string | undefined): boolean {
   return capabilityKey === 'network.request' || capabilityKey === 'filesystem.read_text'
-    || capabilityKey === 'presentation.create';
+    || capabilityKey === 'presentation.create' || capabilityKey === 'mcp.call';
 }
 
 function publicSourceUrl(value: string): string {
@@ -1620,6 +1853,12 @@ function publicSourceUrl(value: string): string {
     if (/key|token|secret|password|signature|authorization/i.test(key)) url.searchParams.delete(key);
   }
   return url.toString();
+}
+
+function compactStepVerification(report: TestReport): StepVerificationEvidence {
+  return { mode: report.mode, passed: report.passed, failed: report.failed, blocked: report.blocked,
+    checks: report.cases.slice(0, 10).map(item => ({ id: item.id, status: item.status,
+      codes: item.codes.slice(0, 8) })) };
 }
 
 function formatResult(output: unknown): string {

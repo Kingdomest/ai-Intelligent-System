@@ -9,6 +9,7 @@ import type { HostCall, HostCallResult, HostExecutionContext, HostOperationExecu
 import { canonicalizeFilesystemPath } from './policy.js';
 import { isShellGuiLaunch } from './process-contract.js';
 import { presentationInputSchema, writePresentation } from '../presentations/render.js';
+import type { McpService } from '../mcp/service.js';
 
 export interface HostOperationAdapters {
   fetch?: typeof fetch;
@@ -22,6 +23,7 @@ export interface HostOperationAdapters {
   maxNetworkBodyBytes?: number;
   maxOutputBytes?: number;
   timeoutMs?: number;
+  mcp?: McpService;
 }
 
 export interface AutomaticGetResult {
@@ -31,7 +33,7 @@ export interface AutomaticGetResult {
   body: string;
 }
 
-const supportedPermissions = new Set<CapabilityPermission>(['filesystem.read', 'filesystem.write', 'network', 'location', 'process']);
+const supportedPermissions = new Set<CapabilityPermission>(['filesystem.read', 'filesystem.write', 'network', 'location', 'process', 'mcp']);
 
 export class DefaultHostOperationExecutor implements HostOperationExecutor {
   constructor(private readonly adapters: HostOperationAdapters = {}) {}
@@ -84,6 +86,11 @@ export class DefaultHostOperationExecutor implements HostOperationExecutor {
       }
       case 'current':
         return { callId: operation.callId, ok: true, value: { supported: false, reason: 'No location provider is configured.' } };
+      case 'call':
+        return operation.permission === 'mcp'
+          ? { callId: operation.callId, ok: true, value: { server: operation.arguments.server,
+            tool: operation.arguments.tool, content: [{ type: 'text', text: '[dry-run MCP result]' }] } }
+          : failed(operation.callId, 'UNSUPPORTED_ACTION', `Unsupported host action: ${operation.action}`);
       default:
         return failed(operation.callId, 'UNSUPPORTED_ACTION', `Unsupported host action: ${operation.action}`);
     }
@@ -153,6 +160,17 @@ export class DefaultHostOperationExecutor implements HostOperationExecutor {
         return this.adapters.location
           ? { supported: true, ...(await this.adapters.location()) }
           : { supported: false, reason: 'No location provider is configured.' };
+      case 'call': {
+        if (operation.permission !== 'mcp' || !this.adapters.mcp) {
+          throw Object.assign(new Error('MCP client is not configured.'), { code: 'MCP_UNAVAILABLE' });
+        }
+        const { server, tool, arguments: args } = operation.arguments;
+        if (typeof server !== 'string' || typeof tool !== 'string' || operation.target !== `${server}/${tool}`
+          || !args || typeof args !== 'object' || Array.isArray(args)) {
+          throw Object.assign(new Error('Invalid MCP tool request.'), { code: 'INVALID_MCP_REQUEST' });
+        }
+        return this.adapters.mcp.call(server, tool, args as Record<string, unknown>);
+      }
       default:
         throw Object.assign(new Error(`Unsupported host action: ${operation.action}`), { code: 'UNSUPPORTED_ACTION' });
     }
@@ -171,20 +189,21 @@ export class DefaultHostOperationExecutor implements HostOperationExecutor {
     const headers = validateHeaders(operation.arguments.headers);
     const parsedUrl = new URL(url);
     const automaticRequest = context.mode === 'auto' && !context.approvalGranted;
-    let pinnedAddress: string | undefined;
-    if (automaticRequest) {
-      if (method !== 'GET' || parsedUrl.protocol !== 'https:' || parsedUrl.search || parsedUrl.hash || (parsedUrl.port && parsedUrl.port !== '443')) {
-        throw Object.assign(new Error('Automatic network access is restricted to public HTTPS GET requests without URL payloads.'), { code: 'NETWORK_POLICY' });
-      }
-      const addresses = await (this.adapters.lookup ?? ((hostname) => resolveDns(hostname, { all: true, verbatim: true })))(parsedUrl.hostname);
-      if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
-        throw Object.assign(new Error('Automatic network access cannot reach private or reserved IP addresses.'), { code: 'NETWORK_POLICY' });
-      }
-      pinnedAddress = addresses[0].address;
-    }
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.adapters.timeoutMs ?? 10_000);
+    const timeout = setTimeout(() => controller.abort(), this.adapters.timeoutMs ?? 30_000);
     try {
+      let pinnedAddress: string | undefined;
+      if (automaticRequest) {
+        if (method !== 'GET' || parsedUrl.protocol !== 'https:' || parsedUrl.search || parsedUrl.hash || (parsedUrl.port && parsedUrl.port !== '443')) {
+          throw Object.assign(new Error('Automatic network access is restricted to public HTTPS GET requests without URL payloads.'), { code: 'NETWORK_POLICY' });
+        }
+        const lookup = (this.adapters.lookup ?? ((hostname) => resolveDns(hostname, { all: true, verbatim: true })))(parsedUrl.hostname);
+        const addresses = await withAbort(lookup, controller.signal);
+        if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
+          throw Object.assign(new Error('Automatic network access cannot reach private or reserved IP addresses.'), { code: 'NETWORK_POLICY' });
+        }
+        pinnedAddress = addresses[0].address;
+      }
       const maxOutputBytes = this.adapters.maxOutputBytes ?? 100_000;
       if (automaticRequest && pinnedAddress) {
         return await (this.adapters.autoGet ?? requestPinnedHttps)(parsedUrl, pinnedAddress, controller.signal, maxOutputBytes, headers);
@@ -217,8 +236,8 @@ export class DefaultHostOperationExecutor implements HostOperationExecutor {
       throw Object.assign(new Error('GUI applications must use process.launch, not process.run.'), { code: 'INVALID_PROCESS_ACTION' });
     }
     return this.adapters.runProcess
-      ? this.adapters.runProcess(command, args, cwd, this.adapters.timeoutMs ?? 10_000, this.adapters.maxOutputBytes ?? 100_000)
-      : runChild(command, args, cwd, this.adapters.timeoutMs ?? 10_000, this.adapters.maxOutputBytes ?? 100_000);
+      ? this.adapters.runProcess(command, args, cwd, this.adapters.timeoutMs ?? 120_000, this.adapters.maxOutputBytes ?? 100_000)
+      : runChild(command, args, cwd, this.adapters.timeoutMs ?? 120_000, this.adapters.maxOutputBytes ?? 100_000);
   }
 
   private async launchApplication(operation: HostCall, context: HostExecutionContext): Promise<{ started: boolean; pid: number | null }> {
@@ -227,6 +246,21 @@ export class DefaultHostOperationExecutor implements HostOperationExecutor {
       ? this.adapters.launchApplication(request.executable, request.args, request.cwd)
       : launchDetached(request.executable, request.args, request.cwd);
   }
+}
+
+function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(Object.assign(new Error('Network request timed out.'), { code: 'NETWORK_TIMEOUT' }));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(Object.assign(new Error('Network request timed out.'), { code: 'NETWORK_TIMEOUT' }));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      value => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      error => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
+  });
 }
 
 function launchRequest(operation: HostCall, workspaceRoot: string): { executable: string; args: string[]; cwd: string } {
@@ -430,11 +464,24 @@ function runChild(command: string, args: string[], cwd: string, timeoutMs: numbe
     let stderr = '';
     let overflow = false;
     let timedOut = false;
-    const timeout = setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs);
+    let terminating = false;
+    const stopTree = () => {
+      if (terminating) return;
+      terminating = true;
+      if (process.platform === 'win32' && child.pid) {
+        const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'],
+          { shell: false, windowsHide: true, stdio: 'ignore' });
+        killer.once('error', () => child.kill());
+        killer.once('close', () => child.kill());
+      } else {
+        child.kill();
+      }
+    };
+    const timeout = setTimeout(() => { timedOut = true; stopTree(); }, timeoutMs);
     const collect = (target: 'stdout' | 'stderr', chunk: Buffer) => {
       if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) + chunk.byteLength > maxOutputBytes) {
         overflow = true;
-        child.kill();
+        stopTree();
         return;
       }
       if (target === 'stdout') stdout += chunk.toString('utf8');

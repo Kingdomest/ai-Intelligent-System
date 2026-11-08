@@ -43,6 +43,10 @@ const catalog: Record<string, BuiltinDefinition> = {
     'export async function run(input, host) { return await host.network.request({ url: input.url, method: input.method, headers: input.headers, body: input.body }); }'),
   'location.current': define('location.current', ['location'], [], {},
     'export async function run(input, host) { return await host.location.current(); }'),
+  'mcp.call': define('mcp.call', ['mcp'], ['server', 'tool'], {
+    server: { type: 'string', minLength: 1 }, tool: { type: 'string', minLength: 1 },
+    dynamicArgs: { type: 'object' },
+  }, 'export async function run(input, host) { return await host.mcp.call(input.server, input.tool, input.dynamicArgs || {}); }'),
   'text.count_lines': define('text.count_lines', [], ['text'], {
     text: { type: 'string', maxLength: 100000 },
   }, 'export async function run(input) { if (input.text === "") return { count: 0 }; const lines = input.text.split(/\\r\\n|\\n|\\r/); return { count: lines.length - (lines[lines.length - 1] === "" ? 1 : 0) }; }'),

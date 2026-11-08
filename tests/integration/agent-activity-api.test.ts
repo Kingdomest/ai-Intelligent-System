@@ -33,7 +33,8 @@ it('publishes real role progress through the task API using the wired mock runti
     expect(result?.task.status).toBe('COMPLETED');
     const activity = result?.events.filter(event => event.type === 'agent.activity') ?? [];
     expect(activity.some(event => event.payload.role === 'planner.route' && event.payload.status === 'completed')).toBe(true);
-    expect(activity.some(event => event.payload.role === 'implementer' && event.payload.status === 'completed')).toBe(true);
+    expect(activity.some(event => event.payload.role === 'task-worker-0.tool_create'
+      && event.payload.status === 'completed')).toBe(true);
     expect(activity.some(event => event.payload.role === 'tester.plan' && event.payload.status === 'completed')).toBe(true);
     expect(activity.every(event => !('prompt' in event.payload) && !('output' in event.payload))).toBe(true);
     const agents = runtime.a2aProtocol.listAgents(taskId);
@@ -41,7 +42,7 @@ it('publishes real role progress through the task API using the wired mock runti
     expect(root?.status).toBe('completed');
     expect(agents.some(agent => agent.parentAgentId === root?.id && agent.role === 'planner'
       && agent.status === 'completed')).toBe(true);
-    expect(agents.some(agent => agent.parentAgentId === root?.id && agent.role === 'implementer'
+    expect(agents.some(agent => agent.parentAgentId === root?.id && agent.role === 'task-worker-0'
       && agent.status === 'completed')).toBe(true);
     expect(agents.some(agent => agent.parentAgentId === root?.id && agent.role === 'tester'
       && agent.status === 'completed')).toBe(true);

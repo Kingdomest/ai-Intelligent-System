@@ -1,6 +1,6 @@
 import { summarizeAgentActivity, type ActivityEvent } from './agent-activity.js';
 
-const statusLabels = { running: '执行中', retrying: '超时后重试', completed: '已完成', failed: '本次调用失败', cancelled: '已停止' };
+const statusLabels = { running: '执行中', retrying: '模型请求重试中', completed: '已完成', failed: '本次调用失败', cancelled: '已停止' };
 
 export function AgentActivity({ events }: { events: ActivityEvent[] }) {
   const agents = summarizeAgentActivity(events);

@@ -228,17 +228,17 @@ export class PermissionBroker {
     const action = operation.action.toLowerCase();
     const destructive = operation.permission === 'filesystem.write'
       && (['remove', 'delete'].includes(action) || targetExists);
-    const containsTaskData = operation.permission === 'network'
+    const containsTaskData = operation.permission === 'mcp' || (operation.permission === 'network'
       && (typeof operation.arguments.body === 'string'
         || typeof operation.arguments.content === 'string'
         || operation.arguments.containsTaskData === true
-        || hasSensitiveHeaders(operation.arguments.headers));
+        || hasSensitiveHeaders(operation.arguments.headers)));
     return {
       workspaceRoot: this.workspaceRoot,
       containsTaskData,
       targetExists,
       destructive,
-      external: ['network', 'process', 'location'].includes(operation.permission),
+      external: ['network', 'process', 'location', 'mcp'].includes(operation.permission),
     };
   }
 
@@ -370,6 +370,15 @@ function assertOperationBounded(operation: PermissionOperation): void {
     }
     if (!launch && isShellGuiLaunch(command, args)) {
       throw new PermissionDeniedError('GUI applications must use process.launch, not process.run.');
+    }
+  }
+  if (operation.permission === 'mcp') {
+    const { server, tool, arguments: args } = operation.arguments;
+    if (operation.action !== 'call' || typeof server !== 'string' || typeof tool !== 'string'
+      || !/^[a-z][a-z0-9_-]{0,63}$/.test(server) || !/^[a-zA-Z][a-zA-Z0-9_-]{0,127}$/.test(tool)
+      || operation.target !== `${server}/${tool}` || !args || typeof args !== 'object' || Array.isArray(args)
+      || JSON.stringify(args).length > 20_000) {
+      throw new PermissionDeniedError('MCP call must name a configured server and tool with bounded arguments.');
     }
   }
   const argumentsJson = JSON.stringify(operation.arguments);

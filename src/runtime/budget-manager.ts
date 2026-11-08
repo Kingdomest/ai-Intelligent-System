@@ -3,9 +3,6 @@ import type { Attachment } from '../domain/contracts.js';
 export interface BudgetConfig {
   maxContextTokens: number;
   outputReserveTokens: number;
-  maxTaskDurationMs?: number;
-  maxSteps?: number;
-  maxRetries?: number;
 }
 
 export interface BudgetInput {
@@ -21,15 +18,10 @@ export interface BudgetSnapshot {
 }
 
 export class BudgetManager {
-  public readonly config: Required<BudgetConfig>;
+  public readonly config: BudgetConfig;
 
   constructor(config: BudgetConfig) {
-    this.config = {
-      maxTaskDurationMs: 120_000,
-      maxSteps: 50,
-      maxRetries: 5,
-      ...config,
-    };
+    this.config = config;
   }
 
   check(input: BudgetInput): BudgetSnapshot {

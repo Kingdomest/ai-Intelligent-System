@@ -96,6 +96,24 @@ describe('SqliteStore', () => {
     }
   });
 
+  it('persists full Agent payload references and limits reads to the recipient', () => {
+    const first = createTestStore();
+    const filename = first.filename;
+    first.saveAgentPayloadRef('assignment-1', 'task-1', 'worker-1', {
+      input: { text: 'large input'.repeat(1_000) },
+    });
+    first.close();
+    const second = new SqliteStore(filename);
+    try {
+      expect(second.getAgentPayloadRef('assignment-1', 'worker-1')).toMatchObject({
+        input: { text: 'large input'.repeat(1_000) },
+      });
+      expect(second.getAgentPayloadRef('assignment-1', 'worker-2')).toBeNull();
+    } finally {
+      second.close();
+    }
+  });
+
   it('rejects a duplicate message id with a different envelope', () => {
     const store = createTestStore();
     try {

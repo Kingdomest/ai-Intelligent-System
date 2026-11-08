@@ -14,6 +14,7 @@ const app = await buildApp({
   registerRoutes: (instance) => registerRoutes(instance, runtime),
   webRoot: existsSync(webRoot) ? webRoot : undefined,
 });
+app.addHook('onClose', async () => { await runtime.mcp.close(); });
 await app.listen({ host, port });
 void runtime.taskService.resumeAfterRestart().catch((error: unknown) => {
   console.error('Failed to resume checkpointed Jarvis tasks:', error);

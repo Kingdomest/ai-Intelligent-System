@@ -449,7 +449,7 @@ export class SqliteStore {
     }
   }
 
-  /** user_version 4: persistent dynamic Agent identities and A2A inboxes. */
+  /** user_version 5: persistent Agent identities, inboxes, and full payload references. */
   private migrateAgents(): void {
     const version = this.database.prepare('PRAGMA user_version').get() as { user_version: number };
     this.database.exec('BEGIN IMMEDIATE');
@@ -487,8 +487,15 @@ export class SqliteStore {
           ON agent_messages(recipient_agent_id, status, created_at);
         CREATE INDEX IF NOT EXISTS idx_agent_messages_root
           ON agent_messages(root_task_id, created_at);
+        CREATE TABLE IF NOT EXISTS agent_payload_refs (
+          id TEXT PRIMARY KEY,
+          root_task_id TEXT NOT NULL,
+          recipient_agent_id TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
       `);
-      if (version.user_version < 4) this.database.exec('PRAGMA user_version = 4');
+      if (version.user_version < 5) this.database.exec('PRAGMA user_version = 5');
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -1304,6 +1311,59 @@ export class SqliteStore {
   getAgentMessage(messageId: string): AgentMessageRecord | null {
     const row = this.database.prepare('SELECT * FROM agent_messages WHERE id = ?').get(messageId) as AgentMessageRow | undefined;
     return row ? this.agentMessageFromRow(row) : null;
+  }
+
+  saveAgentPayloadRef(id: string, rootTaskId: string, recipientAgentId: string, payload: unknown): void {
+    const serialized = JSON.stringify(payload);
+    if (serialized === undefined) throw new Error('Agent payload reference must be JSON serializable.');
+    const existing = this.database.prepare('SELECT root_task_id, recipient_agent_id, payload_json FROM agent_payload_refs WHERE id = ?')
+      .get(id) as { root_task_id: string; recipient_agent_id: string; payload_json: string } | undefined;
+    if (existing) {
+      if (existing.root_task_id !== rootTaskId || existing.recipient_agent_id !== recipientAgentId
+        || existing.payload_json !== serialized) throw new Error(`Agent payload reference ${id} has different content.`);
+      return;
+    }
+    this.database.prepare(`INSERT INTO agent_payload_refs (id, root_task_id, recipient_agent_id, payload_json, created_at)
+      VALUES (?, ?, ?, ?, ?)`).run(id, rootTaskId, recipientAgentId, serialized, new Date().toISOString());
+  }
+
+  getAgentPayloadRef(id: string, recipientAgentId: string): unknown | null {
+    const row = this.database.prepare('SELECT payload_json FROM agent_payload_refs WHERE id = ? AND recipient_agent_id = ?')
+      .get(id, recipientAgentId) as { payload_json: string } | undefined;
+    return row ? JSON.parse(row.payload_json) : null;
+  }
+
+  supersedeAgentStepAssignments(rootTaskId: string, stepId: string, currentMessageId: string): void {
+    const rows = this.database.prepare(`SELECT id, payload_json FROM agent_messages
+      WHERE root_task_id = ? AND type = 'request' AND correlation_id = ?
+        AND id <> ? AND status IN ('queued', 'delivered')`)
+      .all(rootTaskId, stepId, currentMessageId) as Array<{ id: string; payload_json: string }>;
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload_json) as { kind?: unknown };
+      if (payload.kind !== 'step.assignment') continue;
+      this.database.prepare(`UPDATE agent_messages SET status = 'failed', error = 'SUPERSEDED'
+        WHERE id = ? AND status IN ('queued', 'delivered')`).run(row.id);
+    }
+  }
+
+  findAssignedStepAgent(rootTaskId: string, mainAgentId: string, stepId: string): string | null {
+    const rows = this.database.prepare(`
+      SELECT recipient_agent_id, payload_json FROM agent_messages
+      WHERE root_task_id = ? AND sender_agent_id = ? AND type = 'request' AND correlation_id = ?
+      ORDER BY created_at ASC, id ASC
+    `).all(rootTaskId, mainAgentId, stepId) as Array<{ recipient_agent_id: string; payload_json: string }>;
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload_json) as { kind?: unknown; stepId?: unknown };
+      if (payload.kind === 'step.assignment' && payload.stepId === stepId) return row.recipient_agent_id;
+    }
+    return null;
+  }
+
+  listTaskAgentMessages(rootTaskId: string): AgentMessageRecord[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM agent_messages WHERE root_task_id = ? ORDER BY rowid DESC LIMIT 2000
+    `).all(rootTaskId) as unknown as AgentMessageRow[];
+    return rows.reverse().map(row => this.agentMessageFromRow(row));
   }
 
   listAgentMessages(recipientAgentId: string, options: {

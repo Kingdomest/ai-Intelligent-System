@@ -52,15 +52,24 @@ const shortcutScript = String.raw`
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $name = $env:JARVIS_RESOLVE_APP
-$roots = @([Environment]::GetFolderPath('CommonStartMenu'), [Environment]::GetFolderPath('StartMenu')) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+$roots = @(
+  @{ path = [Environment]::GetFolderPath('CommonStartMenu'); recurse = $true },
+  @{ path = [Environment]::GetFolderPath('StartMenu'); recurse = $true },
+  @{ path = [Environment]::GetFolderPath('CommonDesktopDirectory'); recurse = $false },
+  @{ path = [Environment]::GetFolderPath('Desktop'); recurse = $false }
+) | Where-Object { $_.path -and (Test-Path -LiteralPath $_.path) }
 $shell = New-Object -ComObject WScript.Shell
 $matches = @()
 foreach ($root in $roots) {
-  foreach ($shortcut in (Get-ChildItem -LiteralPath $root -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue)) {
+  foreach ($shortcut in (Get-ChildItem -LiteralPath $root.path -Filter '*.lnk' -File -Recurse:$($root.recurse) -ErrorAction SilentlyContinue)) {
     if ($shortcut.BaseName -ieq $name -or $shortcut.BaseName.IndexOf($name, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-      $target = $shell.CreateShortcut($shortcut.FullName).TargetPath
-      if ($target -and $target.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) {
-        $matches += @{ name = $shortcut.BaseName; target = $target }
+      try {
+        $target = $shell.CreateShortcut($shortcut.FullName).TargetPath
+        if ($target -and $target.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) {
+          $matches += @{ name = $shortcut.BaseName; target = $target }
+        }
+      } catch {
+        # One broken shortcut must not hide other applications.
       }
     }
   }

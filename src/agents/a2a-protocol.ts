@@ -118,6 +118,13 @@ export class A2AProtocol {
     return this.store.listAgentMessages(agentId, options);
   }
 
+  getPayloadRef(agentId: string, payloadId: string): unknown {
+    if (!this.store.getAgent(agentId)) throw new A2AProtocolError('AGENT_NOT_FOUND', `Agent not found: ${agentId}`, 404);
+    const payload = this.store.getAgentPayloadRef(payloadId, agentId);
+    if (payload === null) throw new A2AProtocolError('PAYLOAD_NOT_FOUND', 'Agent payload reference not found.', 404);
+    return payload;
+  }
+
   ackMessage(agentId: string, messageId: string, status: Extract<AgentMessageStatus, 'delivered' | 'read' | 'failed'>,
     error?: string): AgentMessageRecord {
     if (!this.store.getAgent(agentId)) throw new A2AProtocolError('AGENT_NOT_FOUND', `Agent not found: ${agentId}`, 404);

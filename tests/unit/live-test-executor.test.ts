@@ -35,6 +35,27 @@ function processOperation(store: SqliteStore, taskId: string, action: 'run' | 'l
 }
 
 describe('live verification', () => {
+  it('requires a real checkout and matching origin after git clone exits successfully', async () => {
+    const { store, task, directory } = setup();
+    const checkout = join(directory, 'repo');
+    mkdirSync(checkout);
+    const remote = 'https://github.com/deepseek-ai/deepseek-harness.git';
+    const operationId = `${task.id}:clone:1.0.0:0`;
+    const now = new Date().toISOString();
+    store.createOperation({ taskId: task.id, operationId, state: 'executing', createdAt: now, updatedAt: now,
+      operation: { operationId, permission: 'process', action: 'run', target: 'git', reason: 'Clone repository',
+        arguments: { command: 'git', args: ['clone', '--depth', '1', remote, '.'], cwd: checkout } } });
+    store.completeOperation(task.id, operationId, { callId: 'clone', ok: true,
+      value: { exitCode: 0, stdout: '', stderr: '' } });
+    const executor = new TestExecutor(new SandboxRunner());
+    const observe = () => executor.runLive(store, task.id, 'clone', '1.0.0', ['process'], { cases: [] }, new WindowsDesktopObserver());
+    expect((await observe()).cases.find(item => item.id === 'git-checkout')?.codes).toContain('GIT_CHECKOUT_MISSING');
+    mkdirSync(join(checkout, '.git'));
+    writeFileSync(join(checkout, '.git', 'config'), `[remote "origin"]\n\turl = ${remote}\n`);
+    writeFileSync(join(checkout, 'README.md'), 'Checkout content');
+    expect(await observe()).toMatchObject({ passed: 2, failed: 0, blocked: 0 });
+  });
+
   it('verifies only the current corrected attempt instead of counting an earlier failed target', async () => {
     const { store, task, directory } = setup();
     const oldPath = join(realpathSync.native(directory), 'missing.md');

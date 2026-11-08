@@ -27,7 +27,7 @@ export class BraveWebSearch implements WebSearchPort {
     const response = await this.fetcher(url, {
       method: 'GET',
       headers: { Accept: 'application/json', 'X-Subscription-Token': this.apiKey },
-      signal: AbortSignal.timeout(8_000),
+      signal: AbortSignal.timeout(15_000),
       redirect: 'error',
     });
     if (!response.ok) throw new Error(`Web search failed with HTTP ${response.status}.`);

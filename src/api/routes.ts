@@ -13,9 +13,12 @@ import { persistableCorrectionFailure } from '../runtime/correction-router.js';
 import { publicTaskEvent } from '../runtime/event-projection.js';
 import { answerSourcesFromEvents } from '../runtime/answer-sources.js';
 import { buildSessionLog } from '../runtime/session-logs.js';
+import { buildTaskFlow } from '../runtime/task-flow.js';
 import { registerA2ARoutes } from './a2a-routes.js';
 import type { A2AProtocol } from '../agents/a2a-protocol.js';
 import type { AgentController } from '../runtime/agent-controller.js';
+import type { McpService } from '../mcp/service.js';
+import type { ToolDiscovery } from '../capabilities/tool-discovery.js';
 
 export interface ApiServices {
   taskService: Pick<TaskService, 'createAndStart' | 'resumeWithInput' | 'resolveApproval' | 'cancelTask'>;
@@ -24,6 +27,8 @@ export interface ApiServices {
   sessionService: SessionService;
   a2aProtocol?: A2AProtocol;
   agentController?: AgentController;
+  mcp?: McpService;
+  toolDiscovery?: ToolDiscovery;
 }
 
 const taskBodySchema = z.object({
@@ -69,6 +74,15 @@ export async function registerRoutes(app: FastifyInstance, services: ApiServices
   if (services.a2aProtocol && services.agentController) {
     registerA2ARoutes(app, services.a2aProtocol, services.agentController, services.store);
   }
+  app.get('/api/mcp/servers', async () => ({ servers: services.mcp ? await services.mcp.inspect() : [] }));
+  app.get('/api/tools', async () => ({ tools: services.toolDiscovery ? await services.toolDiscovery.list() : [] }));
+  app.get('/api/tools/search', async (request, reply) => {
+    const parsed = z.object({ query: z.string().trim().min(1).max(500),
+      limit: z.coerce.number().int().min(1).max(30).default(8) }).safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: '需要 query（最多 500 字符）和 1～30 的 limit。' });
+    return { query: parsed.data.query, tools: services.toolDiscovery
+      ? await services.toolDiscovery.search(parsed.data.query, parsed.data.limit) : [] };
+  });
 
   app.post('/api/tasks', async (request, reply) => {
     try {
@@ -124,6 +138,13 @@ export async function registerRoutes(app: FastifyInstance, services: ApiServices
       events: services.store.listEvents(task.id).map(publicTaskEvent),
       result: task.result ?? null,
     };
+  });
+
+  app.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/flow', async (request, reply) => {
+    const task = services.store.getTask(request.params.taskId);
+    if (!task) return reply.code(404).send({ error: 'Task not found.' });
+    return buildTaskFlow(task, services.store.listAgents(task.id),
+      services.store.listTaskAgentMessages(task.id), services.store.listEvents(task.id));
   });
 
   app.post<{ Params: { taskId: string } }>('/api/tasks/:taskId/cancel', async (request, reply) => {

@@ -1,9 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OllamaProvider } from '../../src/model/ollama-provider.js';
+import { OpenAICompatibleProvider } from '../../src/model/openai-compatible-provider.js';
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe('OllamaProvider', () => {
+  it('applies shorter role-specific request deadlines across both providers', () => {
+    const local = new OllamaProvider({ baseUrl: 'http://localhost:11434', model: 'test',
+      timeoutMs: 300_000, reviewTimeoutMs: 120_000, routeTimeoutMs: 180_000 });
+    const external = new OpenAICompatibleProvider({ baseUrl: 'https://example.com/v1', apiKey: 'key', model: 'test',
+      timeoutMs: 300_000, reviewTimeoutMs: 120_000, routeTimeoutMs: 180_000 });
+    for (const provider of [local, external]) {
+      expect(provider.describeRequest({ role: 'planner', system: '', user: '' }).timeoutMs).toBe(300_000);
+      expect(provider.describeRequest({ role: 'planner.route', system: '', user: '' }).timeoutMs).toBe(180_000);
+      expect(provider.describeRequest({ role: 'planner.review', system: '', user: '' }).timeoutMs).toBe(120_000);
+    }
+  });
+
   it('keeps malformed model content for trajectory diagnostics', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ message: { content: '{"ok":' } }),
       { status: 200 })));
