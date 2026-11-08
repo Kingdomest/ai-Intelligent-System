@@ -7,12 +7,22 @@ const count = (value: unknown): number =>
   typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1000, Math.trunc(value))) : 0;
 const duration = (value: unknown): number =>
   typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(86_400_000, Math.trunc(value))) : 0;
+const promptText = (value: unknown, limit: number): string =>
+  typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit) : '';
 
 /** An allowlist also makes historical events safe to return without rewriting SQLite. */
 export function publicTaskEvent(event: TaskEvent): TaskEvent {
   const source = event.payload ?? {};
   const payload: Record<string, unknown> = {};
   switch (event.type) {
+    case 'agent.activity':
+      payload.runId = label(source.runId);
+      payload.role = label(source.role);
+      payload.status = source.status === 'running' || source.status === 'retrying'
+        || source.status === 'completed' || source.status === 'failed' || source.status === 'cancelled'
+        ? source.status : undefined;
+      if (typeof source.durationMs === 'number') payload.durationMs = duration(source.durationMs);
+      break;
     case 'task.status':
       payload.status = label(source.status);
       break;
@@ -44,6 +54,16 @@ export function publicTaskEvent(event: TaskEvent): TaskEvent {
       payload.source = label(source.source);
       payload.evaluator = label(source.evaluator);
       payload.failureCode = label(source.failureCode);
+      break;
+    case 'plan.reviewed':
+      payload.stepId = label(source.stepId);
+      payload.outcome = source.outcome === 'success' || source.outcome === 'failure' ? source.outcome : undefined;
+      payload.action = source.action === 'continue' || source.action === 'replan' || source.action === 'block'
+        ? source.action : undefined;
+      break;
+    case 'plan.revised':
+      payload.stepId = label(source.stepId);
+      payload.remaining = count(source.remaining);
       break;
     case 'step.started':
     case 'step.paused':
@@ -81,11 +101,20 @@ export function publicTaskEvent(event: TaskEvent): TaskEvent {
           return { name: label(item.name), reason: '执行所需', sensitive: item.sensitive === true };
         }) : [];
       const names = requiredFields.map(field => field.name).filter(Boolean).join('、');
+      const sensitive = requiredFields.some(field => field.sensitive);
+      const modelOptions = !sensitive && Array.isArray(request.options)
+        ? request.options.slice(0, 3).flatMap(option => {
+          const item = option && typeof option === 'object' ? option as Record<string, unknown> : {};
+          const label = promptText(item.label, 80);
+          const value = promptText(item.value, 200);
+          return label && value ? [{ label, value, description: promptText(item.description, 160) }] : [];
+        }) : [];
+      const candidates = Array.isArray(request.candidates)
+        ? request.candidates.filter((candidate): candidate is string => typeof candidate === 'string'
+          && /^[A-Za-z]:\\[^\r\n]{1,240}\.exe$/i.test(candidate)).slice(0, 3) : [];
       payload.request = {
-        question: names ? `请补充执行任务所需的信息：${names}` : '请补充执行任务所需的信息。',
-        candidates: Array.isArray(request.candidates)
-          ? request.candidates.filter((candidate): candidate is string => typeof candidate === 'string'
-            && /^[A-Za-z]:\\[^\r\n]{1,240}\.exe$/i.test(candidate)).slice(0, 10) : [],
+        question: promptText(request.question, 240) || (names ? `请补充执行任务所需的信息：${names}` : '请补充执行任务所需的信息。'),
+        options: modelOptions.length === 3 ? modelOptions : candidates.map(candidate => ({ label: candidate, value: candidate })),
         requiredFields,
       };
       break;

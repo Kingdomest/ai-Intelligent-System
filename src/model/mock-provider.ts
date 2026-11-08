@@ -8,8 +8,17 @@ export class MockModelProvider implements ModelProvider {
 
   async complete(request: ModelRequest): Promise<ModelCompletion> {
     this.calls += 1;
-    if (request.role === 'planner.route') return this.completion({ status: 'ready' });
+    if (request.role === 'planner.route') {
+      const input = JSON.parse(request.user) as { clarification?: unknown };
+      return this.completion({ status: 'ready', ...(input.clarification ? { clarificationValid: true } : {}) });
+    }
     if (request.role === 'planner.correction') return this.completion({ action: 'revise_answer', reason: 'Correct the failed answer.' });
+    if (request.role === 'planner.review') {
+      const input = JSON.parse(request.user) as { outcome: { status: 'success' | 'failure' } };
+      return this.completion(input.outcome.status === 'success'
+        ? { action: 'continue', reason: 'The verified step supports the current plan.' }
+        : { action: 'block', reason: 'The mock planner cannot safely determine a revised direction.' });
+    }
     if (request.role === 'session.compaction') return this.completion({ summary: mockSessionSummary(request.user) });
     if (request.role === 'planner') {
       return this.completion({

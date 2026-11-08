@@ -59,7 +59,7 @@ export class OllamaProvider implements ModelProvider {
             { role: 'user', content: request.user },
           ],
         }),
-        signal: controller.signal,
+        signal: request.signal ? AbortSignal.any([controller.signal, request.signal]) : controller.signal,
       });
 
       if (!response.ok) {
@@ -87,6 +87,7 @@ export class OllamaProvider implements ModelProvider {
         requestId: payload.model ? `ollama:${payload.model}` : undefined,
       };
     } catch (error) {
+      if (request.signal?.aborted) throw error;
       if (error instanceof Error && error.name === 'AbortError') {
         throw new Error(`Ollama request timed out during ${request.role} after ${timeoutMs}ms${stream ? ' without output or at the hard deadline' : ''}.`);
       }

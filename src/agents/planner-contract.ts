@@ -21,6 +21,7 @@ export interface ValidatedPlannerDecision {
     question: string;
     requiredFields: Array<{ name: string; reason: string; sensitive: boolean }>;
     resumeToken: string;
+    options?: Array<{ label: string; value: string; description?: string }>;
   };
   requiredCapabilities?: Array<{ name: string; purpose: string; riskLevel: 'low' | 'medium' | 'high' }>;
   acceptanceCriteria: string[];
@@ -31,7 +32,7 @@ const nonEmpty = z.string().trim().min(1);
 const fsPath = z.object({ path: nonEmpty }).strict();
 const writeTextInput = z.union([
   z.object({ path: nonEmpty, content: z.string() }).strict(),
-  z.object({ path: nonEmpty, generation: z.object({ instruction: nonEmpty.max(500) }).strict() }).strict(),
+  z.object({ path: nonEmpty, generation: z.object({ instruction: nonEmpty.max(2_000) }).strict() }).strict(),
 ]);
 const networkUrl = z.url().refine(value => {
   let decoded = value;
@@ -57,6 +58,8 @@ const requestSchema = z.object({
   taskId: z.string(), question: nonEmpty,
   requiredFields: z.array(z.object({ name: nonEmpty, reason: nonEmpty, sensitive: z.boolean() })),
   resumeToken: z.string(),
+  options: z.array(z.object({ label: nonEmpty.max(80), value: nonEmpty.max(200),
+    description: z.string().max(160).optional() })).max(3).optional(),
 });
 const requiredCapabilitySchema = z.object({ name: nonEmpty, purpose: nonEmpty, riskLevel: z.enum(['low', 'medium', 'high']) });
 export const plannerStepSchema = z.object({
@@ -90,6 +93,14 @@ export function parsePlannerDecision(raw: unknown): ValidatedPlannerDecision {
   } catch (error) {
     throw fieldError(error);
   }
+  if (decision.status === 'needs_user_input' && decision.inputRequest.options
+    && decision.inputRequest.options.length !== 0 && decision.inputRequest.options.length !== 3) {
+    throw new PlannerContractError('inputRequest.options: provide exactly three distinct choices or an empty list.');
+  }
+  if (decision.status === 'needs_user_input' && decision.inputRequest.options
+    && new Set(decision.inputRequest.options.map(option => option.value)).size !== decision.inputRequest.options.length) {
+    throw new PlannerContractError('inputRequest.options: choices must have distinct values.');
+  }
   const steps = decision.steps.map((step, index) => {
     const schema = inputSchemas[step.capabilityKey];
     if (!schema && !/^dynamic\.[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(step.capabilityKey)) {
@@ -98,7 +109,7 @@ export function parsePlannerDecision(raw: unknown): ValidatedPlannerDecision {
     let input = step.input;
     if (schema) {
       try {
-        input = schema.parse(step.input);
+        input = schema.parse(normalizeKnownPlannerInput(step.capabilityKey, step.input));
       } catch (error) {
         throw fieldError(error, `steps[${index}].input`);
       }
@@ -109,7 +120,35 @@ export function parsePlannerDecision(raw: unknown): ValidatedPlannerDecision {
   });
   validateStepGraph(steps);
   validateResourceKinds(steps);
+  validateObservedDataFlow(steps);
   return { ...decision, steps };
+}
+
+const observedDataKeys = new Set(['network.request', 'filesystem.read_text', 'location.current', 'process.run',
+  'text.count_lines', 'text.replace', 'json.format']);
+
+/** A file that depends on live observations must be written from those observations at execution time. */
+export function hasObservedDataDependency(steps: Array<Pick<ValidatedPlanStep, 'id' | 'dependsOn'>
+  & { capabilityKey?: string }>, stepId: string): boolean {
+  const byId = new Map(steps.map(step => [step.id, step]));
+  const seen = new Set<string>();
+  const visit = (id: string): boolean => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    const step = byId.get(id);
+    return !!step && (observedDataKeys.has(step.capabilityKey ?? '') || step.capabilityKey?.startsWith('dynamic.') === true
+      || step.dependsOn.some(dependency => visit(dependency)));
+  };
+  return byId.get(stepId)?.dependsOn.some(dependency => visit(dependency)) ?? false;
+}
+
+function validateObservedDataFlow(steps: ValidatedPlanStep[]): void {
+  for (const step of steps) {
+    if (step.capabilityKey !== 'filesystem.write_text' || !('content' in step.input)) continue;
+    if (hasObservedDataDependency(steps, step.id)) {
+      throw new PlannerContractError(`step ${step.id} writes static content before using its observed dependency results; use generation.instruction.`);
+    }
+  }
 }
 
 type ResourceKind = 'file' | 'directory';
@@ -168,11 +207,27 @@ export function validateStepInput(capabilityKey: string, input: Record<string, u
   // may change ordinary planner arguments, but cannot invent a new executable.
   if (capabilityKey === 'process.launch') {
     const { executable, applicationId, ...plannedInput } = input;
-    return { ...schema.parse(plannedInput),
+    return { ...schema.parse(normalizeKnownPlannerInput(capabilityKey, plannedInput)),
       ...(typeof executable === 'string' ? { executable } : {}),
       ...(typeof applicationId === 'string' ? { applicationId } : {}) };
   }
-  return schema.parse(input);
+  return schema.parse(normalizeKnownPlannerInput(capabilityKey, input));
+}
+
+/** Correct only unambiguous model-shape mistakes; never invent operation arguments. */
+function normalizeKnownPlannerInput(capabilityKey: string, input: Record<string, unknown>): Record<string, unknown> {
+  if ((capabilityKey === 'process.launch' || capabilityKey === 'process.run')
+    && input.args && typeof input.args === 'object' && !Array.isArray(input.args)
+    && Object.keys(input.args).length === 0) {
+    return { ...input, args: [] };
+  }
+  if (capabilityKey === 'network.request') {
+    // The host owns request deadlines and retries. These planner-supplied
+    // transport hints cannot affect the request and must not invalidate a plan.
+    const { timeout: _timeout, timeoutMs: _timeoutMs, retries: _retries, ...operation } = input;
+    return operation;
+  }
+  return input;
 }
 
 function unwrapTypedValues(value: unknown, depth = 0): unknown {

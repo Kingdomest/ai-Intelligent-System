@@ -14,6 +14,92 @@ function branchSchema(schema: unknown, status: string): any {
 }
 
 describe('AgentRunner', () => {
+  it('uses the routed scenario to compose a focused planner system prompt', async () => {
+    let plannerSystem = '';
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      if (request.role === 'planner.route') return { data: { status: 'ready', scenario: 'web' },
+        usage: { inputTokens: 1, outputTokens: 1 } };
+      plannerSystem = request.system;
+      return { data: { status: 'ready', intent: 'read public data', acceptanceCriteria: ['data retrieved'],
+        requiredCapabilities: [], steps: [{ id: 'fetch', capabilityKey: 'network.request', description: 'Fetch data',
+          dependsOn: [], input: { url: 'https://example.org/data', method: 'GET' } }] },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    await runner.runPlanner({ taskId: 'web-data', message: '查询最新公开数据', attachments: [] });
+    expect(plannerSystem).toContain('credential-free sources');
+    expect(plannerSystem).not.toContain('Open-Meteo');
+    expect(plannerSystem).not.toContain('file-specific instruction');
+  });
+
+  it('removes an unrequested saved report from a live research plan', async () => {
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => ({
+      data: request.role === 'planner.route' ? { status: 'ready', scenario: 'web' }
+        : { status: 'ready', intent: 'research hiring',
+          acceptanceCriteria: ['Retrieve public evidence', 'Save the report to the desktop'],
+          requiredCapabilities: [{ name: 'filesystem.write_text', purpose: 'Save report', riskLevel: 'medium' }],
+          steps: [
+            { id: 'fetch', capabilityKey: 'network.request', description: 'Fetch evidence', dependsOn: [],
+              input: { url: 'https://example.org/data', method: 'GET' } },
+            { id: 'report', capabilityKey: 'filesystem.write_text', description: 'Save report', dependsOn: ['fetch'],
+              input: { path: 'C:/Users/Example/Desktop/report.md', content: 'Unsupported result' } },
+          ] }, usage: { inputTokens: 1, outputTokens: 1 },
+    }) }));
+    const plan = await runner.runPlanner({ taskId: 'research', message: '调研当前 Java 岗位招聘情况', attachments: [] });
+    expect(plan.steps.map(step => step.capabilityKey)).toEqual(['network.request']);
+    expect(plan.acceptanceCriteria).toEqual(['Retrieve public evidence']);
+  });
+
+  it('does not permit a direct answer when routing identifies a live-data scenario', async () => {
+    const requests: import('../../src/model/gateway.js').ModelRequest[] = [];
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      requests.push(request);
+      return { data: request.role === 'planner.route' ? { status: 'answer', scenario: 'weather' }
+        : { status: 'ready', intent: 'weather', acceptanceCriteria: ['fetch current conditions'],
+          requiredCapabilities: [], steps: [{ id: 'weather', capabilityKey: 'network.request',
+            description: 'Fetch current weather', dependsOn: [], input: { url: 'https://example.org/weather', method: 'GET' } }] },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const plan = await runner.runPlanner({ taskId: 'weather-guard', message: '深圳现在天气如何', attachments: [] });
+    expect(plan.status).toBe('ready');
+    expect(requests.find(request => request.role === 'planner')?.system).toContain('Open-Meteo');
+    expect(JSON.parse(requests.find(request => request.role === 'planner')!.user).requestStatus).toBe('ready');
+  });
+
+  it('asks again when a custom answer does not satisfy the previous question', async () => {
+    const requests: import('../../src/model/gateway.js').ModelRequest[] = [];
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      requests.push(request);
+      return { data: { status: 'ready', scenario: 'weather', clarificationValid: false,
+        followUpQuestion: '请提供广东省内的具体城市，例如广州或深圳。' },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const options = [{ label: '广州', value: '广州' }, { label: '深圳', value: '深圳' }, { label: '东莞', value: '东莞' }];
+    const plan = await runner.runPlanner({ taskId: 'weather-followup',
+      message: '广东天气怎么样\n用户补充信息：{"answer":"广东"}', attachments: [],
+      clarification: { question: '你想查广东哪个城市？',
+        requiredFields: [{ name: 'city', reason: '需要城市', sensitive: false }], options } });
+    expect(plan.status).toBe('needs_user_input');
+    expect(plan.inputRequest?.question).toContain('具体城市');
+    expect(plan.inputRequest?.options).toEqual(options);
+    expect(requests.map(request => request.role)).toEqual(['planner.route']);
+  });
+
+  it('recovers from one malformed routing response before planning', async () => {
+    let routes = 0;
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      if (request.role === 'planner.route') {
+        routes += 1;
+        return { data: routes === 1 ? { status: 'invalid' } : { status: 'answer' },
+          usage: { inputTokens: 1, outputTokens: 1 } };
+      }
+      return { data: { status: 'answer', intent: 'greeting', answer: '你好',
+        acceptanceCriteria: [], requiredCapabilities: [], steps: [] },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    expect((await runner.runPlanner({ taskId: 'route-repair', message: '你好', attachments: [] })).answer).toBe('你好');
+    expect(routes).toBe(2);
+  });
+
   it('searches the prior news topic when a follow-up corrects the year', async () => {
     const prior = '前段时间，华为的汽车踏板踩断事件影响很大，你跟我说下那个事情发生了什么';
     const followup = '不是的，是2026年的事件';
@@ -298,6 +384,89 @@ describe('AgentRunner', () => {
     expect(requests[0]?.user).toContain('The third section is missing');
   });
 
+  it('reviews the global outcome while restoring completed steps without copying large file bodies', async () => {
+    let reviewUser = '';
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      if (request.role === 'planner.review') {
+        reviewUser = request.user;
+        return { data: { action: 'replan', reason: 'The result points to a different source.' },
+          usage: { inputTokens: 1, outputTokens: 1 } };
+      }
+      expect(request.role).toBe('planner.replan');
+      return { data: { status: 'ready', intent: 'read the relevant source', acceptanceCriteria: ['Answer using evidence'],
+        requiredCapabilities: [], steps: [{ id: 'new-read', capabilityKey: 'filesystem.read_text',
+          description: 'Read the relevant source', dependsOn: ['write'], input: { path: 'D:/demo/relevant.md' } }] },
+      usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const written = { id: 'write', capabilityKey: 'filesystem.write_text', description: 'Write a large file',
+      dependsOn: [], input: { path: 'D:/demo/file.txt', content: 'large-file-body'.repeat(2000) } };
+    const decision = await runner.runPlannerReview({ taskId: 'review-1', message: 'Use the right source',
+      plan: { status: 'ready', intent: 'write and read', acceptanceCriteria: ['Answer using evidence'],
+        requiredCapabilities: [], steps: [written, { id: 'old-read', capabilityKey: 'filesystem.read_text',
+          description: 'Read old source', dependsOn: ['write'], input: { path: 'D:/demo/old.md' } }] },
+      step: written, completedStepIds: ['write'],
+      results: [{ stepId: 'write', output: { path: written.input.path }, observedAt: new Date().toISOString() }],
+      outcome: { status: 'success', output: { path: written.input.path } }, safeToReplay: false,
+      workspaceRoot: 'D:/demo', desktopDirectory: 'D:/demo/Desktop' });
+    expect(reviewUser).not.toContain('large-file-body'.repeat(10));
+    expect(decision.action).toBe('replan');
+    if (decision.action === 'replan') {
+      expect(decision.plan.steps.map(step => step.id)).toEqual(['write', 'new-read']);
+      expect(decision.plan.steps[0]?.input?.content).toBe(written.input.content);
+    }
+  });
+
+  it('keeps a large network result out of the per-step review prompt and schema', async () => {
+    let calls = 0;
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      calls += 1;
+      expect(request.role).toBe('planner.review');
+      expect(request.maxOutputTokens).toBeLessThanOrEqual(384);
+      expect(request.user.length).toBeLessThan(6_000);
+      expect(request.user).toContain(String(output.body.length));
+      expect(request.user).not.toContain('SENSITIVE_HTML_MARKER'.repeat(100));
+      expect(request.user).not.toContain('set-cookie');
+      expect(JSON.stringify(request.outputSchema)).not.toContain('requiredCapabilities');
+      return { data: { action: 'continue', reason: 'Relevant content was returned.' },
+        usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const step = { id: 'fetch', capabilityKey: 'network.request', description: 'Fetch public job listings',
+      dependsOn: [], input: { url: 'https://example.org/jobs', method: 'GET' } };
+    const output = { status: 200, ok: true, headers: { 'content-type': 'text/html', 'set-cookie': 'private' },
+      body: `<html><body><h1>Java jobs</h1>${'SENSITIVE_HTML_MARKER'.repeat(4800)}</body></html>` };
+    await runner.runPlannerReview({ taskId: 'large-network-review', message: 'Review Java job listings',
+      plan: { status: 'ready', intent: 'research jobs', acceptanceCriteria: ['Find current Java jobs'],
+        requiredCapabilities: [], steps: [step] }, step, completedStepIds: ['fetch'],
+      results: [{ stepId: 'fetch', output, observedAt: new Date().toISOString() }],
+      outcome: { status: 'success', output }, safeToReplay: true,
+      workspaceRoot: 'D:/demo', desktopDirectory: 'D:/demo/Desktop' });
+    expect(calls).toBe(1);
+  });
+
+  it('leaves report synthesis to the responder during a research replan', async () => {
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => ({
+      data: request.role === 'planner.review'
+        ? { action: 'replan', reason: 'The first source was a redirect.' }
+        : { status: 'ready', intent: 'research jobs', acceptanceCriteria: ['Use public evidence'], requiredCapabilities: [],
+          steps: [
+            { id: 'new-source', capabilityKey: 'network.request', description: 'Fetch another source',
+              dependsOn: [], input: { url: 'https://example.org/jobs', method: 'GET' } },
+            { id: 'synthesize', capabilityKey: 'text.replace', description: 'Synthesize a report',
+              dependsOn: ['new-source'], input: { content: 'Premature report' } },
+          ] }, usage: { inputTokens: 1, outputTokens: 1 },
+    }) }));
+    const step = { id: 'fetch', capabilityKey: 'network.request', description: 'Fetch first source',
+      dependsOn: [], input: { url: 'https://example.org/redirect', method: 'GET' } };
+    const decision = await runner.runPlannerReview({ taskId: 'research-replan', message: '调研当前 Java 招聘市场',
+      plan: { status: 'ready', intent: 'research jobs', acceptanceCriteria: ['Use public evidence'],
+        requiredCapabilities: [], steps: [step] }, step, completedStepIds: ['fetch'],
+      results: [{ stepId: 'fetch', output: { ok: true, body: 'redirect' }, observedAt: new Date().toISOString() }],
+      outcome: { status: 'success', output: { ok: true, body: 'redirect' } }, safeToReplay: true,
+      workspaceRoot: 'D:/demo', desktopDirectory: 'D:/demo/Desktop' });
+    expect(decision.action).toBe('replan');
+    if (decision.action === 'replan') expect(decision.plan.steps.map(item => item.id)).toEqual(['fetch', 'new-source']);
+  });
+
   it('refuses to summarize an incomplete preview of an oversized tool result', async () => {
     let modelCalls = 0;
     const runner = new AgentRunner(new ModelGateway({ complete: async () => {
@@ -345,6 +514,8 @@ describe('AgentRunner', () => {
     expect(decisionSchema.properties.steps.items.required).toEqual(
       expect.arrayContaining(['id', 'capabilityKey', 'description', 'dependsOn', 'input']),
     );
+    expect(decisionSchema.properties.steps.items.properties.input.properties.url.type).toBe('string');
+    expect(decisionSchema.properties.steps.items.properties.input.properties.method.enum).toContain('GET');
     expect(decision.steps[0]).toMatchObject({
       capabilityKey: 'network.request', input: { url: 'https://weather.example.test/current', method: 'GET' },
     });
@@ -357,7 +528,7 @@ describe('AgentRunner', () => {
       schema = request.outputSchema;
       return { data: { status, answer: '你好', intent: 'greeting', acceptanceCriteria: [], requiredCapabilities: [],
         steps: status === 'ready' ? [{ id: 'read', capabilityKey: 'filesystem.read_text', description: 'Read a file', dependsOn: [], input: { path: 'notes.txt' } }] : [],
-        inputRequest: { taskId: 'question', question: '哪个城市？', requiredFields: [], resumeToken: 'resume' } },
+        inputRequest: { taskId: 'question', question: '哪个城市？', requiredFields: [], resumeToken: 'resume', options: [] } },
         usage: { inputTokens: 1, outputTokens: 1 } };
     } }));
     await runner.runPlanner({ taskId: 'question', message: '你好', attachments: [] });
@@ -366,6 +537,7 @@ describe('AgentRunner', () => {
     if (status === 'needs_user_input') {
       expect(selected.required).toContain('inputRequest');
       expect(selected.properties.inputRequest.required).toContain('question');
+      expect(selected.properties.inputRequest.required).toContain('options');
       expect(selected.properties.steps.maxItems).toBe(0);
     } else if (status === 'answer') expect(selected.required).toContain('answer');
     else expect(selected.properties.steps.minItems).toBe(1);
@@ -378,7 +550,8 @@ describe('AgentRunner', () => {
       requests.push(request);
       return { data: { status: 'needs_user_input', intent: 'weather', acceptanceCriteria: [], requiredCapabilities: [], steps: [],
         ...(requests.length === 1 ? {} : { inputRequest: { taskId: 'question', question: '你想查广东哪个城市？',
-          requiredFields: [{ name: 'city', reason: '天气需要具体城市', sensitive: false }], resumeToken: 'resume' } }) },
+          requiredFields: [{ name: 'city', reason: '天气需要具体城市', sensitive: false }], resumeToken: 'resume',
+          options: [{ label: '广州', value: '广州' }, { label: '深圳', value: '深圳' }, { label: '东莞', value: '东莞' }] } }) },
       usage: { inputTokens: 1, outputTokens: 1 } };
     } }));
     const decision = await runner.runPlanner({ taskId: 'question', message: '广东天气怎么样', attachments: [] });
@@ -422,7 +595,8 @@ describe('AgentRunner', () => {
     const runner = new AgentRunner(new ModelGateway({ complete: async request => ({
       data: request.role === 'planner.route' ? { status: 'ready' }
         : { status: 'needs_user_input', intent: 'weather', acceptanceCriteria: [], requiredCapabilities: [], steps: [],
-          inputRequest: { taskId: 'region', question: '你想查询广东哪个城市？', requiredFields: [{ name: 'city', reason: '需要具体城市', sensitive: false }], resumeToken: 'resume' } },
+          inputRequest: { taskId: 'region', question: '你想查询广东哪个城市？', requiredFields: [{ name: 'city', reason: '需要具体城市', sensitive: false }], resumeToken: 'resume',
+            options: [{ label: '广州', value: '广州' }, { label: '深圳', value: '深圳' }, { label: '东莞', value: '东莞' }] } },
       usage: { inputTokens: 1, outputTokens: 1 },
     }) }));
     const plan = await runner.runPlanner({ taskId: 'region', message: '广东天气怎么样', attachments: [] });

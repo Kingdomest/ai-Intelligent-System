@@ -59,6 +59,13 @@ export interface ExecutionCheckpoint {
   stepResults?: Array<{ stepId: string; output: unknown; observedAt: string }>;
   currentStepId: string;
   operationSequence: number;
+  pendingReview?: {
+    stepId: string;
+    outcome: 'success' | 'failure';
+    output?: unknown;
+    failure?: CorrectionFailure;
+    safeToReplay: boolean;
+  };
 }
 
 export type CorrectionTarget = 'answer' | 'plan_or_input' | 'generated_tool';
@@ -164,6 +171,7 @@ export interface UserInputRequest {
   question: string;
   requiredFields: Array<{ name: string; reason: string; sensitive: boolean }>;
   resumeToken: string;
+  options?: Array<{ label: string; value: string; description?: string }>;
 }
 
 export interface CapabilityManifest {

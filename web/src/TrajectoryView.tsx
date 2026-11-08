@@ -3,6 +3,7 @@ import { fetchTrajectory, type TrajectoryEntry, type TrajectorySummary } from '.
 import { countLogFailures, logEntryMessage, logEntrySeverity, type LogSeverity } from './logging.js';
 
 const eventNames: Record<string, string> = {
+  'agent.activity': 'Agent 执行状态',
   'task.status': '任务状态', 'task.completed': '任务完成', 'task.failed': '任务失败',
   'task.blocked': '任务阻塞', 'task.cancelled': '任务取消', 'step.completed': '步骤完成',
   'step.started': '步骤开始', 'step.paused': '步骤暂停', 'step.failed': '步骤失败',
@@ -31,6 +32,7 @@ function entrySummary(entry: TrajectoryEntry): string {
   if (entry.kind === 'model') {
     const model = entry.model;
     if (model?.status === 'running') return '模型正在生成响应';
+    if (model?.status === 'cancelled') return '模型调用已停止';
     if (model?.status === 'failed' || model?.status === 'interrupted') return model.error ?? '模型调用失败';
     return `${model?.modelName || model?.request?.model || '模型'} · ${model?.durationMs ?? 0} ms · 输入 ${model?.inputTokens ?? '—'} / 输出 ${model?.outputTokens ?? '—'} tokens`;
   }
@@ -39,6 +41,7 @@ function entrySummary(entry: TrajectoryEntry): string {
     return `${operation?.state ?? '未知'} · ${operation?.target ?? ''}${operation?.errorCode ? ` · ${operation.errorCode}` : ''}`;
   }
   const payload = entry.payload ?? {};
+  if (entry.type === 'agent.activity') return `${payload.role ?? 'Agent'} · ${payload.status ?? '未知'}${typeof payload.durationMs === 'number' ? ` · ${payload.durationMs} ms` : ''}`;
   if (entry.type === 'research.searched') return `找到 ${typeof payload.sourceCount === 'number' ? payload.sourceCount : 0} 条来源`;
   if (entry.type === 'answer.sources') return `记录 ${Array.isArray(payload.sources) ? payload.sources.length : 0} 条来源`;
   return [payload.status, payload.stepId, payload.capability, payload.name, payload.failureCode, payload.reason,

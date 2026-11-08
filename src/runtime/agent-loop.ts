@@ -1,4 +1,4 @@
-import type { AgentRunner, PlannerDecision, ResponseInput } from '../agents/agent-runner.js';
+import type { AgentRunner, PlannerDecision, PlannerInput, ResponseInput, StepReviewInput } from '../agents/agent-runner.js';
 import type { TestAgent, TestReport } from '../agents/test-agent.js';
 import { CapabilityRegistry } from '../capabilities/registry.js';
 import { getBuiltin } from '../capabilities/builtin-catalog.js';
@@ -23,10 +23,18 @@ import { publicTaskEvent } from './event-projection.js';
 import { sanitizeAnswerSources } from './answer-sources.js';
 import { isNewsSearchUrl, parseNewsRss } from '../research/news-rss.js';
 import type { SessionMemorySnapshot } from '../domain/contracts.js';
-import { validateStepInput } from '../agents/planner-contract.js';
+import { parsePlannerDecision, validateStepInput } from '../agents/planner-contract.js';
+import { compactVerifiedResult } from '../agents/step-review-context.js';
 
 export type AgentServices = Pick<AgentRunner, 'runPlanner' | 'runEvaluator' | 'runImplementer'>
-  & Partial<Pick<AgentRunner, 'runResponder' | 'runCorrection' | 'runDraftCorrection' | 'runFileImplementer' | 'runStepRepair'>>;
+  & Partial<Pick<AgentRunner, 'runResponder' | 'runCorrection' | 'runDraftCorrection' | 'runFileImplementer' | 'runStepRepair' | 'runPlannerReview'>>;
+
+class StepReviewRequiredError extends Error {
+  constructor(readonly failure: CorrectionFailure, readonly safeToReplay: boolean,
+    readonly output?: unknown) {
+    super(failure.reason);
+  }
+}
 
 /** Loads the bounded per-session memory that is injected into planner and responder prompts. */
 export interface SessionMemoryPort {
@@ -51,6 +59,8 @@ export interface AgentLoopDependencies {
   desktopDirectory?: string;
   sessionMemory?: SessionMemoryPort;
   appResolver?: (name: string) => Promise<ApplicationResolution>;
+  cancelModelTask?: (taskId: string) => void;
+  clearModelCancellation?: (taskId: string) => void;
 }
 
 type CapabilityOutcome =
@@ -66,16 +76,30 @@ function isConfirmedDryRunContractFailure(error: unknown): boolean {
 }
 
 export class AgentLoop {
+  private readonly cancellationRequested = new Set<string>();
+  private readonly runningTasks = new Set<string>();
   constructor(private readonly dependencies: AgentLoopDependencies) {
     this.dependencies.registry.installBuiltins();
     this.dependencies.permissionBroker?.useCapabilityLookup((name, version, taskId) =>
       this.dependencies.registry.getVersion(name, version, taskId));
   }
 
+  requestCancellation(taskId: string): boolean {
+    if (!this.runningTasks.has(taskId)) return false;
+    this.cancellationRequested.add(taskId);
+    this.dependencies.cancelModelTask?.(taskId);
+    return true;
+  }
+
+  private throwIfCancelled(task: TaskRun): void {
+    if (this.cancellationRequested.has(task.id)) throw new Error('TASK_CANCELLED_BY_USER');
+  }
+
   async run(taskId: string): Promise<TaskRun> {
     const task = this.dependencies.store.getTask(taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
     if (isTerminal(task.status) || task.status === 'WAITING_FOR_APPROVAL') return task;
+    this.runningTasks.add(taskId);
 
     try {
       let currentInput: { message: string; attachments: Array<{ filename: string; content?: string }> } = {
@@ -141,6 +165,7 @@ export class AgentLoop {
           sessionMemory,
           diagnosticContext,
           permissionMode: task.permissionMode,
+          clarification: latestClarification(this.dependencies.store, task.id),
           onResearch: sources => this.event(task, 'research.searched', {
             sourceCount: sources.length, sources: sanitizeAnswerSources(sources) }),
           onDraftProgress: (completed, total) => this.event(task, 'draft.progress', { completed, total }),
@@ -187,8 +212,6 @@ export class AgentLoop {
         }
         if (planner.steps.length === 0) return this.block(task, '计划声明了宿主能力，但没有真实执行步骤，无法验证任务结果。');
 
-        if (!await this.implementPlannedFiles(task, planner)) return this.dependencies.store.getTask(task.id) ?? task;
-
         this.setStatus(task, 'CAPABILITY_ANALYSIS');
         const capabilityOutcome = await this.ensureCapabilities(task, planner, runtimeInput);
         if (capabilityOutcome.state === 'waiting') return task;
@@ -204,10 +227,71 @@ export class AgentLoop {
       }
 
       this.setStatus(task, 'PLAN_READY');
-      while (executedSteps < this.dependencies.maxSteps) {
+      while (executedSteps < this.dependencies.maxSteps || task.executionCheckpoint?.pendingReview) {
+        const pending = task.executionCheckpoint?.pendingReview;
+        if (pending) {
+          const attemptedStep = planner.steps.find(step => step.id === pending.stepId);
+          if (!attemptedStep || !this.dependencies.agents.runPlannerReview
+            || (pending.outcome === 'failure' && !pending.failure)) {
+            return this.block(task, '待复盘步骤的计划或失败证据不完整，已停止继续执行。');
+          }
+          const reviewInput: StepReviewInput = {
+            taskId: task.id, message: task.message, plan: planner,
+            step: { id: attemptedStep.id, capabilityKey: attemptedStep.capabilityKey ?? '',
+              description: attemptedStep.description, input: attemptedStep.input ?? {} },
+            completedStepIds: [...completedSteps], results: stepResults,
+            previousFailures: task.correctionState.failures.map(sanitizeCorrectionFailure),
+            outcome: pending.outcome === 'failure'
+              ? { status: 'failure', failure: sanitizeCorrectionFailure(pending.failure!), output: pending.output }
+              : { status: 'success', output: pending.output ?? stepResults.find(result => result.stepId === pending.stepId)?.output },
+            safeToReplay: pending.safeToReplay, workspaceRoot, desktopDirectory,
+          };
+          let decision: Awaited<ReturnType<NonNullable<AgentServices['runPlannerReview']>>>;
+          try {
+            decision = await this.dependencies.agents.runPlannerReview(reviewInput);
+          } catch (error) {
+            if (pending.failure) this.finishActiveRound(task, pending.failure);
+            return this.block(task, `规划 Agent 无法复盘步骤 ${pending.stepId} 的结果：${error instanceof Error ? error.message : String(error)}`);
+          }
+          this.event(task, 'plan.reviewed', { stepId: pending.stepId, outcome: pending.outcome,
+            action: decision.action });
+          if (decision.action === 'block') {
+            if (pending.failure) this.finishActiveRound(task, pending.failure);
+            return this.block(task, decision.reason);
+          }
+          if (decision.action === 'continue') {
+            if (pending.failure) {
+              this.finishActiveRound(task, pending.failure);
+              return this.block(task, '规划 Agent 不能在失败步骤未解决时继续原计划。');
+            }
+            this.finishActiveRound(task);
+            task.executionCheckpoint!.pendingReview = undefined;
+            this.save(task);
+            continue;
+          }
+          if (decision.action !== 'replan') return this.block(task, '规划 Agent 返回了未知决策。');
+          if (pending.failure) {
+            this.finishActiveRound(task, pending.failure);
+            if (task.correctionState.roundsUsed >= Math.min(MAX_CORRECTION_ROUNDS, this.dependencies.maxRetries)) {
+              return this.fail(task, `全局重规划已达到 ${task.correctionState.roundsUsed} 轮上限：${pending.failure.reason}`);
+            }
+            task.correctionState = beginCorrection(task.correctionState, 'plan_or_input', randomUUID());
+            task.correctionState.currentRound!.phase = 'implement';
+            this.setStatus(task, 'RETRYING');
+            this.event(task, 'correction.round_started', { ordinal: task.correctionState.currentRound!.ordinal,
+              target: 'plan_or_input', failureCode: pending.failure.code });
+          } else {
+            this.finishActiveRound(task);
+          }
+          const adopted = await this.adoptReviewedPlan(task, planner, decision.plan, attemptedStep,
+            completedSteps, stepBindings, runtimeInput, pending.safeToReplay);
+          if (!adopted) return this.dependencies.store.getTask(task.id) ?? task;
+          planner = adopted.planner;
+          stepBindings = adopted.bindings;
+          continue;
+        }
         const nextStep = this.dependencies.scheduler.nextReadyStep(planner, completedSteps);
         if (!nextStep) break;
-        executedSteps += 1;
         const checkpoint = task.executionCheckpoint;
         const binding = stepBindings.find((item) => item.stepId === nextStep.id);
         if (!binding) return this.block(task, `步骤 ${nextStep.id} 缺少已验证能力绑定。`);
@@ -224,10 +308,17 @@ export class AgentLoop {
           currentStepId: nextStep.id,
           operationSequence: checkpoint?.currentStepId === nextStep.id ? checkpoint.operationSequence : 0,
         };
+        if (nextStep.capabilityKey === 'filesystem.write_text' && nextStep.input?.generation
+          && !await this.implementPlannedFiles(task, planner, completedSteps, stepResults, nextStep.id)) {
+          if (task.executionCheckpoint.pendingReview) continue;
+          return this.dependencies.store.getTask(task.id) ?? task;
+        }
+        executedSteps += 1;
         this.setStatus(task, 'EXECUTING');
         const stepStarted = Date.now();
         this.event(task, 'step.started', { stepId: nextStep.id, capability: capability.id, version: capability.version });
-        let result;
+        let result: { completed: boolean; output?: unknown } | undefined;
+        let reviewFailure: StepReviewRequiredError | undefined;
         try {
           result = await this.executeStep(
             task,
@@ -238,31 +329,49 @@ export class AgentLoop {
             capability.manifest.permissions,
           );
         } catch (error) {
+          if (error instanceof StepReviewRequiredError) reviewFailure = error;
           const waitingForApproval = error instanceof ApprovalRequiredError || errorCode(error) === 'APPROVAL_REQUIRED';
+          if (reviewFailure) {
+            task.executionCheckpoint.pendingReview = { stepId: nextStep.id, outcome: 'failure',
+              output: reviewFailure.output, failure: reviewFailure.failure,
+              safeToReplay: reviewFailure.safeToReplay };
+            this.save(task);
+          }
           this.event(task, waitingForApproval ? 'step.paused' : 'step.failed', { stepId: nextStep.id,
             capability: capability.id, version: capability.version, durationMs: Date.now() - stepStarted,
-            failureCode: waitingForApproval ? undefined : errorCode(error) });
-          throw error;
+            failureCode: waitingForApproval ? undefined : reviewFailure?.failure.code ?? errorCode(error) });
+          if (!reviewFailure) throw error;
         }
-        if (!result.completed) {
+        if (!reviewFailure && !result?.completed) {
           this.event(task, 'step.paused', { stepId: nextStep.id, capability: capability.id,
             version: capability.version, durationMs: Date.now() - stepStarted });
           return this.dependencies.store.getTask(task.id) ?? task;
         }
-        lastOutput = result.output;
-        stepResults.push({ stepId: nextStep.id, output: result.output, observedAt: new Date().toISOString() });
-        completedSteps.add(nextStep.id);
-        if (capability.status === 'canary') {
-          this.dependencies.registry.promote(capability.id, capability.version, task.id);
-          this.event(task, 'capability.activated', { name: capability.manifest.name, version: capability.version });
+        this.throwIfCancelled(task);
+        if (!reviewFailure) {
+          lastOutput = result!.output;
+          stepResults.push({ stepId: nextStep.id, output: result!.output, observedAt: new Date().toISOString() });
+          completedSteps.add(nextStep.id);
+          if (capability.status === 'canary') {
+            this.dependencies.registry.promote(capability.id, capability.version, task.id);
+            this.event(task, 'capability.activated', { name: capability.manifest.name, version: capability.version });
+          }
+          task.executionCheckpoint.completedStepIds = [...completedSteps];
+          task.executionCheckpoint.stepResults = stepResults;
+          if (this.dependencies.agents.runPlannerReview) {
+            task.executionCheckpoint.pendingReview = { stepId: nextStep.id, outcome: 'success',
+              safeToReplay: true };
+          }
+          this.save(task);
+          this.event(task, 'step.completed', { stepId: nextStep.id, capability: capability.id,
+            version: capability.version, durationMs: Date.now() - stepStarted });
         }
-        task.executionCheckpoint.completedStepIds = [...completedSteps];
-        this.save(task);
-        this.event(task, 'step.completed', { stepId: nextStep.id, capability: capability.id,
-          version: capability.version, durationMs: Date.now() - stepStarted });
+        if (task.executionCheckpoint.pendingReview) continue;
       }
 
-      if (executedSteps >= this.dependencies.maxSteps) return this.fail(task, '任务超过最大步骤数，已停止循环。');
+      if (executedSteps >= this.dependencies.maxSteps && completedSteps.size !== planner.steps.length) {
+        return this.fail(task, '任务达到最大步骤数，已停止循环。');
+      }
       if (planner.steps.length > 0 && completedSteps.size !== planner.steps.length) {
         return this.fail(task, '任务存在未完成的依赖步骤，已停止循环。');
       }
@@ -283,8 +392,9 @@ export class AgentLoop {
             });
             return { ...result, output: { status: response.status, ok: response.ok, articles } };
           }
-          return { ...result, sourceUrl: step?.capabilityKey === 'network.request' && typeof step.input?.url === 'string'
-            ? publicSourceUrl(step.input.url) : undefined };
+          return { ...result, output: compactVerifiedResult(result.output),
+            sourceUrl: step?.capabilityKey === 'network.request' && typeof step.input?.url === 'string'
+              ? publicSourceUrl(step.input.url) : undefined };
         });
         if (planner.steps.some(step => step.capabilityKey === 'network.request'
           && typeof step.input?.url === 'string' && isNewsSearchUrl(step.input.url))
@@ -303,6 +413,16 @@ export class AgentLoop {
       this.event(task, 'task.completed', {});
       return task;
     } catch (error) {
+      if (this.cancellationRequested.has(taskId)) {
+        task.result = '任务已停止，可发送新的任务。';
+        task.executionCheckpoint = undefined;
+        task.pendingPermission = undefined;
+        task.status = 'CANCELLED';
+        task.updatedAt = new Date().toISOString();
+        this.dependencies.store.saveTask(task);
+        this.dependencies.store.appendEvent(taskId, { type: 'task.cancelled', payload: { reason: 'user-requested' } });
+        return task;
+      }
       if (error instanceof ApprovalRequiredError || errorCode(error) === 'APPROVAL_REQUIRED') return this.dependencies.store.getTask(taskId) ?? task;
       if (error instanceof PermissionDeniedError || errorCode(error) === 'PERMISSION_DENIED') {
         task.result = `任务已停止：${error instanceof Error ? error.message : '权限被拒绝。'}`;
@@ -316,11 +436,89 @@ export class AgentLoop {
       }
       return this.fail(task, error instanceof Error ? error.message : '任务执行失败。');
     } finally {
+      this.cancellationRequested.delete(taskId);
+      this.runningTasks.delete(taskId);
+      this.dependencies.clearModelCancellation?.(taskId);
       if (isTerminal(task.status)) this.dependencies.registry.releaseTask(task.id);
     }
   }
 
-  private async implementPlannedFiles(task: TaskRun, planner: PlannerDecision): Promise<boolean> {
+  private async adoptReviewedPlan(task: TaskRun, previous: PlannerDecision, proposed: PlannerDecision,
+    attemptedStep: PlannerDecision['steps'][number], completed: Set<string>, existingBindings: StepBinding[],
+    runtimeInput: Record<string, unknown>, safeToReplay: boolean): Promise<{ planner: PlannerDecision; bindings: StepBinding[] } | null> {
+    for (const stepId of completed) {
+      const before = previous.steps.find(step => step.id === stepId);
+      const after = proposed.steps.find(step => step.id === stepId);
+      if (!before || !after || !isDeepStrictEqual(before, after)) {
+        this.block(task, `全局重规划修改了已验证步骤 ${stepId}，已拒绝新计划。`);
+        return null;
+      }
+    }
+    let planner: PlannerDecision;
+    try {
+      const normalized = { ...proposed, steps: proposed.steps.map(step => {
+        if (!completed.has(step.id) || step.capabilityKey !== 'process.launch') return step;
+        const { executable, applicationId, ...plannedInput } = step.input ?? {};
+        return { ...step, input: plannedInput };
+      }) };
+      const validated = parsePlannerDecision(normalized);
+      planner = { ...proposed, ...validated,
+        steps: validated.steps.map(step => completed.has(step.id)
+          ? previous.steps.find(item => item.id === step.id)! : step) };
+    } catch (error) {
+      this.block(task, `全局重规划未通过计划校验：${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+    if (planner.status !== 'ready' || planner.steps.length > this.dependencies.maxSteps) {
+      this.block(task, '全局重规划没有提供可执行且在步骤预算内的计划。');
+      return null;
+    }
+    const repeated = planner.steps.some(step => !completed.has(step.id)
+      && step.capabilityKey === attemptedStep.capabilityKey
+      && isDeepStrictEqual(step.input, attemptedStep.input));
+    if (repeated) {
+      this.block(task, `全局重规划仍会重复步骤 ${attemptedStep.id} 的同一操作，已拒绝新计划。`);
+      return null;
+    }
+    if (!safeToReplay) {
+      const ready = planner.steps.filter(step => !completed.has(step.id)
+        && step.dependsOn.every(id => completed.has(id)));
+      const remaining = planner.steps.filter(step => !completed.has(step.id));
+      if (!ready.length || remaining.some(step => !isReadOnlyDiagnostic(step.capabilityKey ?? '', step.input ?? {}))) {
+        this.block(task, '上一步宿主操作的效果尚不确定；新计划只能包含只读诊断。观察诊断结果后才能再次规划写入或启动。');
+        return null;
+      }
+    }
+    for (const step of planner.steps) {
+      if (completed.has(step.id) || step.capabilityKey !== 'process.launch') continue;
+      const resolution = await (this.dependencies.appResolver ?? resolveWindowsApplication)(String(step.input?.applicationName ?? ''));
+      if (resolution.status !== 'resolved') {
+        this.block(task, `新计划中的应用无法安全解析：${resolution.reason}`);
+        return null;
+      }
+      step.input = { ...step.input, executable: resolution.executable, applicationId: resolution.processName };
+    }
+    const capabilities = await this.ensureCapabilities(task, planner, runtimeInput, completed, existingBindings);
+    if (capabilities.state !== 'ready') {
+      if (capabilities.state === 'failed') this.fail(task, capabilities.message);
+      else if (capabilities.state === 'blocked') this.block(task, capabilities.message);
+      return null;
+    }
+    task.acceptanceCriteria = [...new Set([...task.acceptanceCriteria, ...planner.acceptanceCriteria])];
+    planner.acceptanceCriteria = task.acceptanceCriteria;
+    if (task.executionCheckpoint) {
+      task.executionCheckpoint.planner = planner;
+      task.executionCheckpoint.stepBindings = capabilities.bindings;
+      task.executionCheckpoint.completedStepIds = [...completed];
+      task.executionCheckpoint.pendingReview = undefined;
+    }
+    this.save(task);
+    this.event(task, 'plan.revised', { stepId: attemptedStep.id, remaining: planner.steps.length - completed.size });
+    return { planner, bindings: capabilities.bindings };
+  }
+
+  private async implementPlannedFiles(task: TaskRun, planner: PlannerDecision, completed: Set<string>,
+    results: Array<{ stepId: string; output: unknown; observedAt: string }>, onlyStepId: string): Promise<boolean> {
     const files = planner.steps.flatMap(step => {
       const input = step.input;
       if (step.capabilityKey !== 'filesystem.write_text' || !input || typeof input.path !== 'string'
@@ -334,8 +532,12 @@ export class AgentLoop {
       return false;
     }
     this.setStatus(task, 'IMPLEMENTING_FILES');
-    const previousFiles: Array<{ path: string; content: string }> = [];
+    const previousFiles: Array<{ path: string; content: string }> = planner.steps.flatMap(step =>
+      completed.has(step.id) && step.capabilityKey === 'filesystem.write_text'
+        && typeof step.input?.path === 'string' && typeof step.input?.content === 'string'
+        ? [{ path: step.input.path, content: step.input.content }] : []);
     for (const step of planner.steps) {
+      if (completed.has(step.id) || step.id !== onlyStepId) continue;
       const plannedInput = step.input;
       const generation = step.capabilityKey === 'filesystem.write_text' ? plannedInput?.generation : undefined;
       if (!generation || typeof generation !== 'object') continue;
@@ -353,6 +555,13 @@ export class AgentLoop {
           // loses `this.gateway` in production, despite stateless test doubles passing.
           const content = await agents.runFileImplementer({ taskId: task.id, message: task.message, path, instruction,
             files, previousFiles: previousFiles.map(file => ({ path: file.path, content: file.content.slice(0, 4_000) })),
+            verifiedResults: results.slice(-5).map(result => {
+              const sourceStep = planner.steps.find(item => item.id === result.stepId);
+              return { stepId: result.stepId, observedAt: result.observedAt,
+                sourceUrl: sourceStep?.capabilityKey === 'network.request' && typeof sourceStep.input?.url === 'string'
+                  ? publicSourceUrl(sourceStep.input.url) : undefined,
+                output: compactVerifiedResult(result.output, 5_000) };
+            }),
             feedback, permissionMode: task.permissionMode,
             onResearch: sources => this.event(task, 'research.searched', {
               sourceCount: sources.length, sources: sanitizeAnswerSources(sources) }) });
@@ -363,6 +572,14 @@ export class AgentLoop {
           break;
         } catch (error) {
           feedback = error instanceof Error ? error.message : String(error);
+          if (agents.runPlannerReview && task.executionCheckpoint) {
+            task.executionCheckpoint.pendingReview = { stepId: step.id, outcome: 'failure',
+              failure: { stage: 'execution', code: 'FILE_IMPLEMENTATION_FAILED', reason: feedback, stepId: step.id },
+              safeToReplay: true };
+            this.save(task);
+            this.event(task, 'step.failed', { stepId: step.id, failureCode: 'FILE_IMPLEMENTATION_FAILED' });
+            return false;
+          }
           if (error instanceof TypeError) {
             this.block(task, `文件实施 Agent 出现程序或连接异常，重复生成文件无法修复：${feedback}`);
             return false;
@@ -531,14 +748,24 @@ export class AgentLoop {
     }
   }
 
-  private async ensureCapabilities(task: TaskRun, planner: PlannerDecision, runtimeInput: Record<string, unknown>): Promise<CapabilityOutcome> {
+  private async ensureCapabilities(task: TaskRun, planner: PlannerDecision, runtimeInput: Record<string, unknown>,
+    completed = new Set<string>(), existingBindings: StepBinding[] = []): Promise<CapabilityOutcome> {
     const bindings: StepBinding[] = [];
     for (const step of planner.steps) {
+      if (completed.has(step.id)) {
+        const binding = existingBindings.find(item => item.stepId === step.id);
+        if (!binding) return { state: 'blocked', message: `已验证步骤 ${step.id} 缺少原能力绑定。` };
+        bindings.push(binding);
+        continue;
+      }
       const key = step.capabilityKey ?? (planner.requiredCapabilities.length === 1 ? planner.requiredCapabilities[0]!.name : '');
       if (!key) return { state: 'failed', message: `步骤 ${step.id} 没有明确能力键，无法安全绑定工具。` };
       const required = planner.requiredCapabilities.find((item) => item.name === key)
         ?? { name: key, purpose: step.description, riskLevel: 'medium' as const };
-      const executionInput = step.input ?? {};
+      // A generated file receives its content after upstream observations. The
+      // capability dry-run validates the host contract without pre-generating it.
+      const executionInput = step.capabilityKey === 'filesystem.write_text' && step.input?.generation
+        ? { path: step.input.path, content: '' } : step.input ?? {};
       const legacy = !step.capabilityKey;
       const existing = [this.dependencies.registry.findUsableByKey(key, task.id),
         ...(legacy ? [this.dependencies.registry.findUsableByIntent(planner.intent, task.id), this.dependencies.registry.getUsable(required.name, task.id)] : [])]
@@ -768,11 +995,21 @@ export class AgentLoop {
             return { completed: false };
           }
           if (review.verdict === 'blocked') {
+            if (this.dependencies.agents.runPlannerReview) {
+              throw new StepReviewRequiredError({ stage: 'test', code: 'LIVE_TEST_BLOCKED',
+                reason: report.reason ?? '真实测试缺少关键证据', stepId: task.currentStepId,
+                capabilityId: capabilityName, version: capabilityVersion }, false, output);
+            }
             this.block(task, `真实测试无法验证：${report.reason ?? '关键条件缺少证据。'}`);
             return { completed: false };
           }
           if (review.verdict === 'fail') {
             latestFailure = `真实测试失败：${report.reason ?? '测试 Agent 拒绝证据。'}`;
+            if (this.dependencies.agents.runPlannerReview) {
+              throw new StepReviewRequiredError({ stage: 'test', code: 'LIVE_TEST_FAILED', reason: latestFailure,
+                stepId: task.currentStepId, capabilityId: capabilityName, version: capabilityVersion },
+              this.safeToRetry(task, capabilityVersion), output);
+            }
             if (!this.safeToRetry(task, capabilityVersion)) {
               this.block(task, `${latestFailure} 已执行的宿主操作不能安全自动重放。`);
               return { completed: false };
@@ -840,10 +1077,22 @@ export class AgentLoop {
         }
         if (evaluation.status === 'wait_approval') {
           latestFailure = '评估器请求了审批，但没有具体宿主操作可授权。';
+          if (this.dependencies.agents.runPlannerReview) {
+            throw new StepReviewRequiredError({ stage: 'execution', code: 'EVALUATOR_WAIT_APPROVAL',
+              reason: latestFailure, stepId: task.currentStepId,
+              capabilityId: capabilityName, version: capabilityVersion },
+            this.safeToRetry(task, capabilityVersion), output);
+          }
           this.block(task, latestFailure);
           return { completed: false };
         }
         latestFailure = evaluation.failures.map((failure) => failure.message).filter(Boolean).join('；') || `评估评分 ${evaluation.score} 未达到通过标准。`;
+        if (this.dependencies.agents.runPlannerReview) {
+          throw new StepReviewRequiredError({ stage: 'execution',
+            code: evaluation.failures[0]?.code ?? 'STEP_EVALUATION_FAILED', reason: latestFailure,
+            stepId: task.currentStepId, capabilityId: capabilityName, version: capabilityVersion },
+          this.safeToRetry(task, capabilityVersion), output);
+        }
         if (!this.safeToRetry(task, capabilityVersion)) {
           this.block(task, `评估未通过：${latestFailure} 已执行的宿主操作不能安全自动重放。`);
           return { completed: false };
@@ -854,17 +1103,29 @@ export class AgentLoop {
         if (!revised) return { completed: false };
         input = revised;
       } catch (error) {
+        if (error instanceof StepReviewRequiredError) throw error;
         const code = errorCode(error);
         if (code === 'APPROVAL_REQUIRED') return { completed: false };
         if (code === 'OPERATION_UNKNOWN') {
+          if (this.dependencies.agents.runPlannerReview) {
+            throw new StepReviewRequiredError({ stage: 'execution', code: 'OPERATION_UNKNOWN',
+              reason: error instanceof Error ? error.message : '操作状态无法确认',
+              stepId: task.currentStepId, capabilityId: capabilityName, version: capabilityVersion }, false);
+          }
           this.block(task, error instanceof Error ? error.message : '操作状态无法确认，未重放。');
           return { completed: false };
+        }
+        latestFailure = error instanceof Error ? error.message : String(error);
+        if (this.dependencies.agents.runPlannerReview) {
+          throw new StepReviewRequiredError({ stage: 'execution',
+            code: error instanceof HostOperationError ? error.code : 'EXECUTION_ERROR',
+            reason: latestFailure, stepId: task.currentStepId,
+            capabilityId: capabilityName, version: capabilityVersion }, this.safeToRetry(task, capabilityVersion));
         }
         if (!this.safeToRetry(task, capabilityVersion)) {
           this.block(task, '宿主操作结果未通过验证，自动重放可能产生重复副作用。');
           return { completed: false };
         }
-        latestFailure = error instanceof Error ? error.message : String(error);
         const revised = await this.reviseStep(task, planner, input, capabilityName, capabilityVersion,
           { stage: 'execution', code: error instanceof HostOperationError ? error.code : 'EXECUTION_ERROR',
             reason: latestFailure, stepId: task.currentStepId, capabilityId: capabilityName, version: capabilityVersion });
@@ -973,6 +1234,7 @@ export class AgentLoop {
     target: 'answer' | 'plan_or_input' | 'generated_tool',
     evidence: { sourceTaskId?: string; confirmedToolDefect: boolean; safeToReplay: boolean },
     expectedAction: 'revise_answer' | 'revise_plan_or_input' | 'rebuild_generated_tool'): Promise<boolean> {
+    this.throwIfCancelled(task);
     const failure = sanitizeCorrectionFailure(rawFailure);
     this.finishActiveRound(task, failure);
     const category = classifyCorrectionFailure(failure);
@@ -1025,16 +1287,19 @@ export class AgentLoop {
   }
 
   private setStatus(task: TaskRun, status: TaskRun['status']): void {
+    this.throwIfCancelled(task);
     task.status = status;
     this.save(task);
     this.event(task, 'task.status', { status });
   }
 
   private event(task: TaskRun, type: string, payload: Record<string, unknown>): void {
+    this.throwIfCancelled(task);
     this.dependencies.store.appendEvent(task.id, publicTaskEvent({ type, payload }));
   }
 
   private save(task: TaskRun): void {
+    this.throwIfCancelled(task);
     task.updatedAt = new Date().toISOString();
     this.dependencies.store.saveTask(task);
   }
@@ -1048,12 +1313,18 @@ export class AgentLoop {
   }
 }
 
+export class ClarificationInputError extends Error {
+  readonly code = 'INVALID_CLARIFICATION';
+}
+
 export class TaskService {
+  private readonly activeRuns = new Map<string, Promise<TaskRun>>();
   constructor(
     private readonly store: SqliteStore,
     private readonly loop: AgentLoop,
     private readonly permissionBroker?: PermissionBroker,
     private readonly sessionTurns?: { onTaskTerminal(task: TaskRun): Promise<void> },
+    private readonly roleAgents?: { onTaskSettled(task: TaskRun): void },
   ) {}
 
   async createAndWait(input: Parameters<SqliteStore['createTask']>[0]): Promise<TaskRun> {
@@ -1063,13 +1334,41 @@ export class TaskService {
 
   createAndStart(input: Parameters<SqliteStore['createTask']>[0]): TaskRun {
     const task = this.store.createTask(this.withPresentationSource(input));
-    void this.runAndRecord(task.id);
+    void this.runAndRecord(task.id).catch(error => {
+      // The HTTP request has already returned. Keep the rejection observed so
+      // a storage failure does not become an unhandled process rejection.
+      console.error('Background task could not be recorded:', error instanceof Error ? error.name : 'UnknownError');
+    });
     return task;
   }
 
   /** Runs the loop and, once terminal, hands the finished task to the session layer. */
-  private async runAndRecord(taskId: string): Promise<TaskRun> {
-    const task = await this.loop.run(taskId);
+  private runAndRecord(taskId: string): Promise<TaskRun> {
+    const existing = this.activeRuns.get(taskId);
+    if (existing) return existing;
+    const work = this.performRunAndRecord(taskId);
+    this.activeRuns.set(taskId, work);
+    void work.then(() => this.activeRuns.delete(taskId), () => this.activeRuns.delete(taskId));
+    return work;
+  }
+
+  private async performRunAndRecord(taskId: string): Promise<TaskRun> {
+    let task: TaskRun;
+    try {
+      task = await this.loop.run(taskId);
+    } catch {
+      const interrupted = this.store.getTask(taskId);
+      if (!interrupted || isTerminal(interrupted.status)) throw new Error('Task execution ended unexpectedly.');
+      interrupted.status = 'FAILED';
+      interrupted.result = '任务未完成：运行时出现未处理异常。请查看任务轨迹后重试。';
+      interrupted.executionCheckpoint = undefined;
+      interrupted.updatedAt = new Date().toISOString();
+      this.store.saveTask(interrupted);
+      this.store.appendEvent(taskId, { type: 'task.failed', payload: { failureCode: 'UNHANDLED_RUNTIME_ERROR' } });
+      task = interrupted;
+    }
+    try { this.roleAgents?.onTaskSettled(task); }
+    catch { /* Agent identity bookkeeping must not alter the task result. */ }
     if (this.sessionTurns) {
       try {
         await this.sessionTurns.onTaskTerminal(task);
@@ -1078,6 +1377,36 @@ export class TaskService {
       }
     }
     return task;
+  }
+
+  async cancelTask(taskId: string): Promise<TaskRun> {
+    const task = this.store.getTask(taskId);
+    if (!task) throw new Error('Task not found.');
+    if (isTerminal(task.status)) return task;
+    const active = this.activeRuns.get(taskId);
+    if (active && this.loop.requestCancellation(taskId)) {
+      const settled = await active;
+      if (isTerminal(settled.status)) return settled;
+    }
+    const waitingTask = this.store.getTask(taskId);
+    if (!waitingTask) throw new Error('Task not found.');
+    if (isTerminal(waitingTask.status)) return waitingTask;
+    // Waiting for input or approval has no running loop to interrupt.
+    if (waitingTask.status !== 'NEEDS_USER_INPUT' && waitingTask.status !== 'WAITING_FOR_APPROVAL') {
+      throw new Error('Task is not running in this process; refresh its status before stopping.');
+    }
+    waitingTask.status = 'CANCELLED';
+    waitingTask.result = '任务已停止，可发送新的任务。';
+    waitingTask.executionCheckpoint = undefined;
+    waitingTask.pendingPermission = undefined;
+    waitingTask.updatedAt = new Date().toISOString();
+    this.store.saveTask(waitingTask);
+    this.store.appendEvent(taskId, { type: 'task.cancelled', payload: { reason: 'user-requested' } });
+    try { this.roleAgents?.onTaskSettled(waitingTask); }
+    catch { /* Agent identity bookkeeping must not alter cancellation. */ }
+    try { await this.sessionTurns?.onTaskTerminal(waitingTask); }
+    catch { /* A session bookkeeping failure must not undo cancellation. */ }
+    return waitingTask;
   }
 
   private withPresentationSource(input: Parameters<SqliteStore['createTask']>[0]): Parameters<SqliteStore['createTask']>[0] {
@@ -1099,15 +1428,40 @@ export class TaskService {
   async resumeWithInput(taskId: string, values: Record<string, unknown>): Promise<TaskRun> {
     const task = this.store.getTask(taskId);
     if (!task || task.status !== 'NEEDS_USER_INPUT') throw new Error('Task is not waiting for user input.');
-    task.message = `${task.message}\n用户补充信息：${JSON.stringify(values)}`;
+    const latestQuestion = [...this.store.listEvents(taskId)].reverse().find(event => event.type === 'task.needs_user_input');
+    const rawRequest = latestQuestion?.payload.request;
+    const request = rawRequest && typeof rawRequest === 'object' ? rawRequest as Record<string, unknown> : {};
+    const answerValue = values.answer ?? (Object.keys(values).length === 1 ? Object.values(values)[0] : undefined);
+    if (typeof answerValue !== 'string' || !answerValue.trim()) {
+      throw new ClarificationInputError('请先选择一个选项，或输入具体答案。');
+    }
+    const answer = answerValue.trim();
+    if (answer.length > 1_000) throw new ClarificationInputError('补充内容过长，请用 1000 字以内说明。');
+    if (/^(?:不知道|不清楚|随便|无|没有|\?|？|n\/a)$/i.test(answer)) {
+      throw new ClarificationInputError('这个回答还不能确定执行所需的信息，请选择上方选项或输入具体内容。');
+    }
+    const fields = Array.isArray(request.requiredFields) ? request.requiredFields as Array<{ name?: unknown }> : [];
+    const fieldNames = fields.map(field => typeof field?.name === 'string' ? field.name.toLowerCase() : '');
+    const choices = Array.isArray(request.options) ? request.options as Array<{ value?: unknown }> : [];
+    const candidates = Array.isArray(request.candidates) ? request.candidates : [];
+    const selected = choices.some(choice => choice?.value === answer) || candidates.includes(answer);
+    if (!selected && fieldNames.some(name => name === 'city' || name.includes('city'))
+      && /(?:省|自治区|全国|国家|整个中国|全省)$/.test(answer)) {
+      throw new ClarificationInputError('还需要具体城市，请选择一个城市或输入城市名称。');
+    }
+    if (!selected && fieldNames.includes('executable') && !/^[A-Za-z]:[\\/][^\r\n]+\.exe$/i.test(answer)) {
+      throw new ClarificationInputError('请输入完整的 Windows .exe 路径，或选择上方找到的应用。');
+    }
+    task.message = `${task.message}\n用户补充信息：${JSON.stringify({ answer })}`;
     task.status = 'INTAKE';
     this.store.saveTask(task);
-    this.store.appendEvent(task.id, { type: 'task.input_received', payload: { fields: Object.keys(values) } });
+    this.store.appendEvent(task.id, { type: 'task.input_received', payload: { fields: ['answer'] } });
     return this.runAndRecord(taskId);
   }
 
   async resolveApproval(taskId: string, requestId: string, approved: boolean): Promise<TaskRun> {
     if (!this.permissionBroker) throw new Error('Approval flow is not enabled.');
+    if (this.store.getTask(taskId)?.status === 'CANCELLED') throw new Error('Task was cancelled.');
     const hadPendingRequest = this.store.getTask(taskId)?.pendingPermission?.requestId === requestId;
     try {
       await this.permissionBroker.resolve(taskId, requestId, approved);
@@ -1143,8 +1497,10 @@ export class TaskService {
           `${taskId}:${checkpoint.currentStepId}:${checkpoint.capabilityVersion}:${checkpoint.operationSequence}`);
         const capability = checkpoint && this.store.getCapabilityVersion(checkpoint.capabilityName, checkpoint.capabilityVersion);
         const readOnly = capability?.manifest.permissions.length === 1 && capability.manifest.permissions[0] === 'filesystem.read';
-        if (capability?.manifest.provenance.sourceTaskId === 'builtin'
-          && (currentVerified || currentOperation?.state === 'completed' || readOnly)) {
+        const pureBuiltin = capability?.manifest.provenance.sourceTaskId === 'builtin'
+          && capability.manifest.permissions.length === 0;
+        if (checkpoint?.pendingReview || capability?.manifest.provenance.sourceTaskId === 'builtin'
+          && (currentVerified || currentOperation?.state === 'completed' || readOnly || pureBuiltin)) {
           await this.runAndRecord(taskId);
           resumed += 1;
           continue;
@@ -1160,10 +1516,30 @@ export class TaskService {
   }
 }
 
+function isReadOnlyDiagnostic(capabilityKey: string, input: Record<string, unknown>): boolean {
+  if (capabilityKey === 'filesystem.read_text' || capabilityKey === 'location.current'
+    || capabilityKey === 'text.count_lines' || capabilityKey === 'text.replace'
+    || capabilityKey === 'json.format') return true;
+  return capabilityKey === 'network.request' && (input.method === 'GET' || input.method === 'HEAD');
+}
+
 function isPlannerDecision(value: unknown): value is PlannerDecision {
   return !!value && typeof value === 'object'
     && 'intent' in value && 'steps' in value && Array.isArray((value as { steps?: unknown }).steps)
     && 'requiredCapabilities' in value && Array.isArray((value as { requiredCapabilities?: unknown }).requiredCapabilities);
+}
+
+function latestClarification(store: SqliteStore, taskId: string): PlannerInput['clarification'] {
+  const event = [...store.listEvents(taskId)].reverse().find(item => item.type === 'task.needs_user_input');
+  const raw = event?.payload.request;
+  if (!raw || typeof raw !== 'object') return undefined;
+  const request = raw as Record<string, unknown>;
+  if (typeof request.question !== 'string') return undefined;
+  return { question: request.question,
+    requiredFields: Array.isArray(request.requiredFields)
+      ? request.requiredFields as NonNullable<PlannerInput['clarification']>['requiredFields'] : [],
+    options: Array.isArray(request.options)
+      ? request.options as NonNullable<PlannerInput['clarification']>['options'] : undefined };
 }
 
 function createRuntimeInput(

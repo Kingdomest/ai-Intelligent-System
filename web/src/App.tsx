@@ -15,6 +15,7 @@ import { shouldSubmitComposerOnEnter } from './composer-keyboard.js';
 import { sendTaskNotice } from './task-notification.js';
 import { TrajectoryView } from './TrajectoryView.js';
 import { SessionLogView } from './SessionLogView.js';
+import { AgentActivity } from './AgentActivity.js';
 import { sessionSwitchReset } from './session-switch.js';
 
 type EventItem = { type: string; payload: Record<string, unknown>; createdAt?: string };
@@ -122,7 +123,9 @@ export function App() {
   const [files, setFiles] = useState<File[]>([]);
   const [task, setTask] = useState<TaskPayload | null>(null);
   const [busy, setBusy] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [supplement, setSupplement] = useState('');
+  const [supplementError, setSupplementError] = useState('');
   const [supplementSubmitting, setSupplementSubmitting] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => readPermissionMode());
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
@@ -222,6 +225,7 @@ export function App() {
     setTask(reset.task);
     setBusy(reset.busy);
     setSupplement(reset.supplement);
+    setSupplementError('');
     setSupplementSubmitting(reset.supplementSubmitting);
     setApprovalMessage('');
     localStorage.setItem('jarvis.activeSessionId', sessionId);
@@ -451,6 +455,24 @@ export function App() {
     }
   }
 
+  async function stopTask() {
+    if (!task || terminalStatuses.has(task.task.status) || stopping) return;
+    const taskId = task.task.id;
+    setStopping(true);
+    try {
+      const response = await fetch(`/api/tasks/${taskId}/cancel`, { method: 'POST' });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { error?: string };
+        throw new Error(payload.error ?? '停止任务失败');
+      }
+      await refreshTask(taskId);
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : '停止任务失败，请重试。');
+    } finally {
+      setStopping(false);
+    }
+  }
+
   async function submitTask(event: React.FormEvent) {
     event.preventDefault();
     if (busy || (!input.trim() && files.length === 0)) return;
@@ -516,20 +538,27 @@ export function App() {
 
   async function submitSupplement(event: React.FormEvent) {
     event.preventDefault();
-    if (!task || !supplement.trim() || supplementSubmitting) return;
+    if (!task || supplementSubmitting) return;
+    if (!supplement.trim()) { setSupplementError('请选择一个选项，或输入具体答案。'); return; }
     setSupplementSubmitting(true);
+    setSupplementError('');
     try {
       const response = await fetch(`/api/tasks/${task.task.id}/input`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ values: { answer: supplement.trim() } }),
       });
-      if (!response.ok) throw new Error('Input submission failed');
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { error?: string };
+        if (response.status === 422) { setSupplementError(payload.error ?? '请补充更具体的信息。'); return; }
+        throw new Error(payload.error ?? '补充信息提交失败');
+      }
       setSupplement('');
+      setSupplementError('');
       setBusy(true);
       await refreshTask(task.task.id);
-    } catch {
-      setConnectionError('补充信息提交失败，请检查连接后重试。');
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : '补充信息提交失败，请检查连接后重试。');
       setBusy(false);
     } finally {
       setSupplementSubmitting(false);
@@ -607,7 +636,7 @@ export function App() {
   const newsApprovalPending = task?.task.status === 'WAITING_FOR_APPROVAL'
     && task.task.pendingPermission?.operation.target.startsWith('https://news.google.com/rss/search?');
   const inputRequest = [...(task?.events ?? [])].reverse().find((event) => event.type === 'task.needs_user_input')?.payload.request as {
-    question?: string; candidates?: string[];
+    question?: string; options?: Array<{ label: string; value: string; description?: string }>;
   } | undefined;
   const showWelcome = !activeSessionId && !legacyView && messages.length === 0;
 
@@ -739,9 +768,10 @@ export function App() {
                   <strong>{newsApprovalPending ? '等待授权联网搜索'
                     : newsSearchStarted ? newsSearchDone ? '正在根据搜索结果核对回答' : '正在搜索网页'
                       : statusLabels[task.task.status] ?? task.task.status}</strong>
-                  <small>{typeof draftProgress?.completed === 'number' && typeof draftProgress.total === 'number'
-                    ? `长篇文案已生成 ${draftProgress.completed}/${draftProgress.total} 段，正在继续校验`
-                    : 'Harness 正在协调主智能体、测试智能体、评估智能体和实施智能体'}</small>
+                  {typeof draftProgress?.completed === 'number' && typeof draftProgress.total === 'number'
+                    ? <small>长篇文案已生成 {draftProgress.completed}/{draftProgress.total} 段，正在继续校验</small>
+                    : null}
+                  <AgentActivity events={task.events} />
                   {activeSources.length > 0 ? <AnswerSources sources={activeSources} /> : null}
                 </div>
               </article>
@@ -801,17 +831,23 @@ export function App() {
         {activeView === 'chat' && task?.task.status === 'NEEDS_USER_INPUT' ? (
           <form className="follow-up-card" onSubmit={submitSupplement}>
             <strong>{inputRequest?.question ?? '请补充执行任务所需的信息'}</strong>
-            {inputRequest?.candidates?.length ? (
-              <div className="input-candidates" aria-label="可选应用路径">
-                {inputRequest.candidates.map((candidate) => (
-                  <button type="button" key={candidate} onClick={() => setSupplement(candidate)}>{candidate}</button>
+            {inputRequest?.options?.length ? (
+              <div className="input-candidates" aria-label="可选答案">
+                {inputRequest.options.map((option) => (
+                  <button type="button" key={option.value} className={supplement === option.value ? 'selected' : ''}
+                    aria-pressed={supplement === option.value} disabled={supplementSubmitting}
+                    onClick={() => { setSupplement(option.value); setSupplementError(''); }}>
+                    <span>{option.label}</span>{option.description ? <small>{option.description}</small> : null}
+                  </button>
                 ))}
               </div>
             ) : null}
             <div className="follow-up-row">
-              <input value={supplement} onChange={(event) => setSupplement(event.target.value)} placeholder="补充信息" disabled={supplementSubmitting} />
+              <input value={supplement} onChange={(event) => { setSupplement(event.target.value); setSupplementError(''); }}
+                placeholder="也可以直接输入你的答案" disabled={supplementSubmitting} aria-invalid={Boolean(supplementError)} />
               <button type="submit" className="send-button" disabled={supplementSubmitting}>{supplementSubmitting ? '正在继续…' : '发送'}</button>
             </div>
+            {supplementError ? <p className="follow-up-error" role="alert">{supplementError}</p> : null}
           </form>
         ) : null}
 
@@ -885,6 +921,10 @@ export function App() {
                 </div>
               ) : null}
             </div>
+            {task && !terminalStatuses.has(task.task.status) ? (
+              <button type="button" className="stop-button" aria-label="停止当前任务" disabled={stopping}
+                onClick={() => void stopTask()}>{stopping ? '正在停止…' : '停止'}</button>
+            ) : null}
             <button type="submit" className="send-button" aria-label="发送" disabled={busy}>{busy ? '…' : <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19V5m-5 5 5-5 5 5" /></svg>}</button>
           </div>
         </form> : null}

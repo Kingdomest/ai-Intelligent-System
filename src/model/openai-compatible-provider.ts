@@ -54,7 +54,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
             { role: 'user', content: request.user },
           ],
         }),
-        signal: controller.signal,
+        signal: request.signal ? AbortSignal.any([controller.signal, request.signal]) : controller.signal,
       });
 
       const rawBody = await response.text();
@@ -87,6 +87,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         requestId: payload.id,
       };
     } catch (error) {
+      if (request.signal?.aborted) throw error;
       if (error instanceof ModelProviderError) throw error;
       if (error instanceof Error && error.name === 'AbortError') {
         throw new ModelProviderError('Model request timed out.');

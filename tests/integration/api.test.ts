@@ -9,7 +9,7 @@ import { SandboxRunner } from '../../src/capabilities/sandbox-runner.js';
 import { ToolFactory } from '../../src/capabilities/tool-factory.js';
 import { buildApp } from '../../src/api/app.js';
 import { registerRoutes, type ApiServices } from '../../src/api/routes.js';
-import { ModelGateway } from '../../src/model/gateway.js';
+import { ModelGateway, type ModelProvider } from '../../src/model/gateway.js';
 import { MockModelProvider } from '../../src/model/mock-provider.js';
 import { AgentLoop } from '../../src/runtime/agent-loop.js';
 import { SessionService } from '../../src/runtime/session-service.js';
@@ -37,14 +37,14 @@ function multipart(fields: Record<string, string>, file?: { name: string; conten
   return { boundary, payload: chunks.join('') };
 }
 
-function createApi() {
+function createApi(modelProvider: ModelProvider = new MockModelProvider()) {
   const directory = mkdtempSync(join(tmpdir(), 'jarvis-api-'));
   temporaryDirectories.push(directory);
   const store = new SqliteStore(join(directory, 'jarvis.sqlite'));
   const sandbox = new SandboxRunner();
   const executor = new DefaultHostOperationExecutor();
   const permissionBroker = new PermissionBroker(store, executor, directory);
-  const gateway = new ModelGateway(new MockModelProvider());
+  const gateway = new ModelGateway(modelProvider);
   const agents = new AgentRunner(gateway);
   const registry = new CapabilityRegistry(store, sandbox);
   const loop = new AgentLoop({
@@ -62,9 +62,11 @@ function createApi() {
     maxSteps: 50,
     permissionBroker,
     workspaceRoot: directory,
+    cancelModelTask: taskId => gateway.cancelTask(taskId),
+    clearModelCancellation: taskId => gateway.clearTaskCancellation(taskId),
   });
-  const taskService = new TaskService(store, loop, permissionBroker);
   const sessionService = new SessionService(store, gateway);
+  const taskService = new TaskService(store, loop, permissionBroker, sessionService);
   const services: ApiServices = { taskService, store, registry, sessionService };
   return { store, services, directory, permissionBroker, executor };
 }
@@ -112,6 +114,65 @@ afterEach(() => {
 });
 
 describe('task API', () => {
+  it('stops an in-flight model request, records cancellation, and accepts the next session task', async () => {
+    const fallback = new MockModelProvider();
+    let signal: AbortSignal | undefined;
+    let started!: () => void;
+    const modelStarted = new Promise<void>(resolve => { started = resolve; });
+    let firstPlanner = true;
+    const provider: ModelProvider = { async complete(request) {
+      if (request.role === 'planner' && firstPlanner) {
+        firstPlanner = false;
+        signal = request.signal;
+        started();
+        await new Promise<never>((_resolve, reject) => {
+          request.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+        });
+      }
+      return fallback.complete(request);
+    } };
+    const { services, store } = createApi(provider);
+    const app = await buildApp({ registerRoutes: instance => registerRoutes(instance, services) });
+    const session = (await app.inject({ method: 'POST', url: '/api/sessions', payload: {} })).json().session.id as string;
+    const created = await app.inject({ method: 'POST', url: '/api/tasks', payload: {
+      message: 'First task', sessionId: session, attachments: [], permissionMode: 'request',
+    } });
+    const taskId = created.json().taskId as string;
+    await modelStarted;
+
+    const stopped = await app.inject({ method: 'POST', url: `/api/tasks/${taskId}/cancel` });
+    expect(stopped.json()).toMatchObject({ taskId, status: 'CANCELLED' });
+    expect(signal?.aborted).toBe(true);
+    expect(store.listEvents(taskId).filter(event => event.type === 'task.cancelled')).toHaveLength(1);
+    expect(store.listEvents(taskId).some(event => event.type === 'task.failed')).toBe(false);
+    expect(store.listSessionMessages(session).items.some(message => message.taskId === taskId
+      && message.role === 'assistant' && message.content.includes('任务已停止'))).toBe(true);
+    expect((await app.inject({ method: 'POST', url: `/api/tasks/${taskId}/cancel` })).json().status).toBe('CANCELLED');
+
+    const next = await app.inject({ method: 'POST', url: '/api/tasks', payload: {
+      message: 'Second task', sessionId: session, attachments: [], permissionMode: 'request',
+    } });
+    expect(next.statusCode).toBe(202);
+    await waitForTerminal(app, next.json().taskId as string);
+    await app.close();
+    store.close();
+  }, 15_000);
+
+  it('cancels a task awaiting approval and rejects a stale approval', async () => {
+    const { services, store, directory, permissionBroker } = createApi();
+    const task = await createPendingFolderTask(store, permissionBroker, directory);
+    const requestId = task.pendingPermission!.requestId;
+    const app = await buildApp({ registerRoutes: instance => registerRoutes(instance, services) });
+    const stopped = await app.inject({ method: 'POST', url: `/api/tasks/${task.id}/cancel` });
+    expect(stopped.json().status).toBe('CANCELLED');
+    const approval = await app.inject({ method: 'POST', url: `/api/tasks/${task.id}/approval`,
+      payload: { requestId, approved: true } });
+    expect(approval.statusCode).toBe(409);
+    expect(store.getTask(task.id)?.status).toBe('CANCELLED');
+    await app.close();
+    store.close();
+  });
+
   it('exposes redacted correction progress without the internal round identifier', async () => {
     const { services, store } = createApi();
     const task = store.createTask({ message: 'Summarize a guide', attachments: [] });
@@ -334,6 +395,62 @@ describe('task API', () => {
     expect(response.statusCode).toBe(202);
     expect(response.json().taskId).toBe(waiting.id);
 
+    await app.close();
+    store.close();
+  });
+
+  it('keeps an invalid clarification pending and accepts a concrete choice', async () => {
+    const { services, store } = createApi();
+    const waiting = store.createTask({ message: '广东天气怎么样', attachments: [] });
+    waiting.status = 'NEEDS_USER_INPUT';
+    store.saveTask(waiting);
+    store.appendEvent(waiting.id, { type: 'task.needs_user_input', payload: { request: {
+      taskId: waiting.id, question: '你想查广东哪个城市？', resumeToken: 'resume-city',
+      requiredFields: [{ name: 'city', reason: '天气需要具体城市', sensitive: false }],
+      options: [{ label: '广州', value: '广州' }, { label: '深圳', value: '深圳' }, { label: '东莞', value: '东莞' }],
+    } } });
+    const app = await buildApp({ registerRoutes: instance => registerRoutes(instance, services) });
+    const question = await app.inject({ method: 'GET', url: `/api/tasks/${waiting.id}` });
+    expect(question.json().events.at(-1).payload.request.options).toHaveLength(3);
+    const invalid = await app.inject({ method: 'POST', url: `/api/tasks/${waiting.id}/input`,
+      payload: { values: { answer: '广东省' } } });
+    expect(invalid.statusCode).toBe(422);
+    expect(invalid.json().error).toContain('具体城市');
+    expect(store.getTask(waiting.id)?.status).toBe('NEEDS_USER_INPUT');
+    expect(store.getTask(waiting.id)?.message).toBe('广东天气怎么样');
+    const valid = await app.inject({ method: 'POST', url: `/api/tasks/${waiting.id}/input`,
+      payload: { values: { answer: '深圳' } } });
+    expect(valid.statusCode).toBe(202);
+    expect(valid.json().status).not.toBe('FAILED');
+    expect(store.getTask(waiting.id)?.message).toContain('"answer":"深圳"');
+    await app.close();
+    store.close();
+  });
+
+  it('asks a focused follow-up when routing finds a semantically wrong custom answer', async () => {
+    const provider: ModelProvider = { async complete(request) {
+      expect(request.role).toBe('planner.route');
+      return { data: { status: 'ready', scenario: 'weather', clarificationValid: false,
+        followUpQuestion: '请提供地球上的具体城市。' }, usage: { inputTokens: 1, outputTokens: 1 } };
+    } };
+    const { services, store } = createApi(provider);
+    const waiting = store.createTask({ message: '广东天气怎么样', attachments: [] });
+    waiting.status = 'NEEDS_USER_INPUT';
+    store.saveTask(waiting);
+    store.appendEvent(waiting.id, { type: 'task.needs_user_input', payload: { request: {
+      taskId: waiting.id, question: '你想查广东哪个城市？', resumeToken: 'resume-city',
+      requiredFields: [{ name: 'city', reason: '天气需要具体城市', sensitive: false }],
+      options: [{ label: '广州', value: '广州' }, { label: '深圳', value: '深圳' }, { label: '东莞', value: '东莞' }],
+    } } });
+    const app = await buildApp({ registerRoutes: instance => registerRoutes(instance, services) });
+    const submitted = await app.inject({ method: 'POST', url: `/api/tasks/${waiting.id}/input`,
+      payload: { values: { answer: '火星' } } });
+    expect(submitted.statusCode).toBe(202);
+    expect(submitted.json().status).toBe('NEEDS_USER_INPUT');
+    const detail = (await app.inject({ method: 'GET', url: `/api/tasks/${waiting.id}` })).json();
+    const lastQuestion = detail.events.filter((event: { type: string }) => event.type === 'task.needs_user_input').at(-1);
+    expect(lastQuestion.payload.request.question).toBe('请提供地球上的具体城市。');
+    expect(lastQuestion.payload.request.options).toHaveLength(3);
     await app.close();
     store.close();
   });

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { CapabilityRegistry } from '../capabilities/registry.js';
 import type { Attachment, CreateTaskInput } from '../domain/contracts.js';
 import { TaskService } from '../runtime/task-service.js';
+import { ClarificationInputError } from '../runtime/agent-loop.js';
 import { SessionMemoryFullError, SessionService } from '../runtime/session-service.js';
 import { SqliteStore } from '../storage/sqlite-store.js';
 import { MAX_CORRECTION_ROUNDS } from '../runtime/correction-round.js';
@@ -17,7 +18,7 @@ import type { A2AProtocol } from '../agents/a2a-protocol.js';
 import type { AgentController } from '../runtime/agent-controller.js';
 
 export interface ApiServices {
-  taskService: Pick<TaskService, 'createAndStart' | 'resumeWithInput' | 'resolveApproval'>;
+  taskService: Pick<TaskService, 'createAndStart' | 'resumeWithInput' | 'resolveApproval' | 'cancelTask'>;
   store: SqliteStore;
   registry: CapabilityRegistry;
   sessionService: SessionService;
@@ -125,6 +126,16 @@ export async function registerRoutes(app: FastifyInstance, services: ApiServices
     };
   });
 
+  app.post<{ Params: { taskId: string } }>('/api/tasks/:taskId/cancel', async (request, reply) => {
+    if (!services.store.getTask(request.params.taskId)) return reply.code(404).send({ error: 'Task not found.' });
+    try {
+      const task = await services.taskService.cancelTask(request.params.taskId);
+      return { taskId: task.id, status: task.status };
+    } catch (error) {
+      return reply.code(409).send({ error: error instanceof Error ? error.message : 'Task cannot be stopped.' });
+    }
+  });
+
   app.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/trajectory', async (request, reply) => {
     if (!services.store.getTask(request.params.taskId)) return reply.code(404).send({ error: 'Task not found.' });
     const query = trajectoryQuerySchema.parse(request.query ?? {});
@@ -151,6 +162,9 @@ export async function registerRoutes(app: FastifyInstance, services: ApiServices
       const task = await services.taskService.resumeWithInput(request.params.taskId, body.values);
       return reply.code(202).send({ taskId: task.id, status: task.status });
     } catch (error) {
+      if (error instanceof ClarificationInputError) {
+        return reply.code(422).send({ error: error.message, code: error.code });
+      }
       return reply.code(409).send({ error: error instanceof Error ? error.message : 'Task cannot accept input.' });
     }
   });

@@ -22,7 +22,7 @@ export interface ConcurrencyInput {
 export class AdaptiveScheduler {
   constructor(private readonly config: SchedulerConfig) {}
 
-  nextReadyStep(plan: TaskPlan, completed: Set<string>): PlanStep | null {
+  nextReadyStep<T extends PlanStep>(plan: { steps: T[] }, completed: Set<string>): T | null {
     return plan.steps.find((step) => (
       !completed.has(step.id) && step.dependsOn.every((dependency) => completed.has(dependency))
     )) ?? null;

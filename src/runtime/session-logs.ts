@@ -86,7 +86,9 @@ function eventMessage(entry: TrajectoryEntry): string {
 function modelLine(entry: TrajectoryEntry): { level: SessionLogLevel; source: string; message: string; details: Record<string, unknown> } {
   const model = entry.model;
   const failed = model?.status === 'failed' || model?.status === 'interrupted';
-  const message = model?.error ? safeText(model.error) : failed ? '模型调用中断，结果未知' : '模型调用完成';
+  const cancelled = model?.status === 'cancelled';
+  const message = cancelled ? '模型调用已由用户停止' : model?.error ? safeText(model.error)
+    : failed ? '模型调用中断，结果未知' : '模型调用完成';
   const details: Record<string, unknown> = {
     model: model?.modelName || '未记录', status: model?.status ?? 'unknown', durationMs: model?.durationMs ?? null,
     inputTokens: model?.inputTokens ?? null, outputTokens: model?.outputTokens ?? null,
@@ -94,7 +96,7 @@ function modelLine(entry: TrajectoryEntry): { level: SessionLogLevel; source: st
   if (model?.requestId) details.requestId = model.requestId;
   if (model?.errorDetails) details.errorDetails = model.errorDetails;
   if (failed && model?.rawResponse) details.rawResponse = safeText(model.rawResponse);
-  return { level: failed ? 'ERROR' : 'INFO', source: `模型/${entry.type}`, message, details };
+  return { level: failed ? 'ERROR' : cancelled ? 'WARN' : 'INFO', source: `模型/${entry.type}`, message, details };
 }
 
 function operationLine(entry: TrajectoryEntry): { level: SessionLogLevel; source: string; message: string; details: Record<string, unknown> } {

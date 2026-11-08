@@ -609,10 +609,16 @@ export class SqliteStore {
       WHERE task.status IN ('PLAN_READY', 'EXECUTING', 'TEST_PLANNING', 'TESTING_LIVE', 'TEST_REVIEW', 'EVALUATING', 'RETRYING')
         AND task.execution_checkpoint_json IS NOT NULL
         AND task.pending_permission_json IS NULL
-        AND EXISTS (SELECT 1 FROM operation_journal AS completed
-          WHERE completed.task_id = task.id AND completed.state = 'completed')
-        AND NOT EXISTS (SELECT 1 FROM operation_journal AS unsettled
-          WHERE unsettled.task_id = task.id AND unsettled.state <> 'completed')
+        AND (json_extract(task.execution_checkpoint_json, '$.pendingReview.stepId') IS NOT NULL
+          OR EXISTS (SELECT 1 FROM capabilities AS pure
+              WHERE pure.id = json_extract(task.execution_checkpoint_json, '$.capabilityName')
+                AND pure.version = json_extract(task.execution_checkpoint_json, '$.capabilityVersion')
+                AND json_extract(pure.manifest_json, '$.provenance.sourceTaskId') = 'builtin'
+                AND json_array_length(pure.manifest_json, '$.permissions') = 0)
+          OR (EXISTS (SELECT 1 FROM operation_journal AS completed
+              WHERE completed.task_id = task.id AND completed.state = 'completed')
+            AND NOT EXISTS (SELECT 1 FROM operation_journal AS unsettled
+              WHERE unsettled.task_id = task.id AND unsettled.state <> 'completed')))
       ORDER BY task.updated_at ASC
     `).all() as Array<{ id: string }>;
     return rows.map((row) => row.id);
@@ -972,7 +978,7 @@ export class SqliteStore {
     return id;
   }
 
-  finishModelTrace(id: string, outcome: { completion?: ModelCompletion; error?: string;
+  finishModelTrace(id: string, outcome: { completion?: ModelCompletion; error?: string; cancelled?: boolean;
     rawResponse?: string; errorDetails?: { name: string; statusCode?: number; requestId?: string } }): void {
     const started = this.database.prepare('SELECT created_at FROM model_calls WHERE id = ?')
       .get(id) as { created_at: string } | undefined;
@@ -982,7 +988,7 @@ export class SqliteStore {
     const rawResponse = outcome.completion?.rawContent ?? outcome.rawResponse;
     this.database.prepare(`UPDATE model_calls SET status = ?, response_json = ?, raw_response = ?, error = ?, request_id = ?,
       input_tokens = ?, output_tokens = ?, duration_ms = ?, finished_at = ?, error_meta_json = ? WHERE id = ?`)
-      .run(outcome.error ? 'failed' : 'completed', response, rawResponse ? traceText(rawResponse) : null,
+      .run(outcome.cancelled ? 'cancelled' : outcome.error ? 'failed' : 'completed', response, rawResponse ? traceText(rawResponse) : null,
         outcome.error ? traceText(outcome.error) : null,
         outcome.completion?.requestId ?? outcome.errorDetails?.requestId ?? null, outcome.completion?.usage.inputTokens ?? null,
         outcome.completion?.usage.outputTokens ?? null,

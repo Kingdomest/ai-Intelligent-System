@@ -126,6 +126,8 @@ describe('AgentLoop', () => {
       }
       if (request.role === 'implementer.file') return { data: { content: '<!doctype html><title>Game</title><button>Play</button>' },
         usage: { inputTokens: 1, outputTokens: 1 } };
+      if (request.role === 'planner.review') return { data: { action: 'continue', reason: 'The game file was verified.' },
+        usage: { inputTokens: 1, outputTokens: 1 } };
       if (request.role === 'evaluator') return { data: { status: 'pass', verdict: 'pass', score: 1,
         failures: [], recommendations: [], evidence: ['Verified file operation'] },
       usage: { inputTokens: 1, outputTokens: 1 } };
@@ -185,6 +187,105 @@ describe('AgentLoop', () => {
     expect(store.listStepOperations(task.id, 'prepare', '1.0.0')).toHaveLength(1);
     expect(store.listEvents(task.id).some(event => event.type === 'step.verified'
       && event.payload.evaluator === 'conflicted')).toBe(true);
+  });
+
+  it('reviews a successful step and replaces the remaining global plan', async () => {
+    const { store, directory } = createService();
+    const first = { id: 'first', capabilityKey: 'filesystem.read_text', description: 'Read initial evidence',
+      dependsOn: [], input: { path: join(directory, 'one.md') } };
+    const oldSecond = { id: 'old-second', capabilityKey: 'filesystem.read_text', description: 'Read outdated source',
+      dependsOn: ['first'], input: { path: join(directory, 'old.md') } };
+    const newSecond = { id: 'new-second', capabilityKey: 'filesystem.read_text', description: 'Read relevant source',
+      dependsOn: ['first'], input: { path: join(directory, 'two.md') } };
+    writeFileSync(first.input.path, 'first evidence');
+    writeFileSync(newSecond.input.path, 'second evidence');
+    const reviews: string[] = [];
+    const agents: AgentServices = {
+      runPlanner: async () => ({ status: 'ready', intent: 'review two sources', acceptanceCriteria: ['Use both sources'],
+        requiredCapabilities: [], steps: [first, oldSecond] }),
+      runPlannerReview: async input => {
+        reviews.push(input.step.id);
+        expect(input.outcome.status).toBe('success');
+        if (input.step.id === 'first') {
+          expect(input.results).toHaveLength(1);
+          return { action: 'replan', reason: 'The first source points to a different second source.',
+            plan: { status: 'ready', intent: 'review relevant sources', acceptanceCriteria: ['Use both sources'],
+              requiredCapabilities: [], steps: [first, newSecond] } };
+        }
+        return { action: 'continue', reason: 'The second source supports the goal.' };
+      },
+      runImplementer: async () => { throw new Error('Use maintained reader'); },
+      runResponder: async input => input.results.map(item => (item.output as { content: string }).content).join('; '),
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+    };
+    const broker = new PermissionBroker(store, new DefaultHostOperationExecutor(), directory);
+    const task = await new TaskService(store, createAgentLoop(store, directory, agents, broker), broker)
+      .createAndWait({ message: 'Review the relevant sources', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    expect(reviews).toEqual(['first', 'new-second']);
+    expect(task.result).toContain('second evidence');
+    expect(store.listStepOperations(task.id, 'first', '1.0.0')).toHaveLength(1);
+    expect(store.listStepOperations(task.id, 'old-second', '1.0.0')).toHaveLength(0);
+    expect(store.listEvents(task.id).filter(event => event.type === 'plan.reviewed')).toHaveLength(2);
+  });
+
+  it('sends a failed outcome to global planning and changes direction without a local patch', async () => {
+    const { store, directory } = createService();
+    const validPath = join(directory, 'actual.md');
+    writeFileSync(validPath, 'actual evidence');
+    const observed: Array<{ status: string; completed: string[]; safe: boolean }> = [];
+    const agents: AgentServices = {
+      runPlanner: async () => ({ status: 'ready', intent: 'read evidence', acceptanceCriteria: ['Read evidence'],
+        requiredCapabilities: [], steps: [{ id: 'wrong-direction', capabilityKey: 'filesystem.read_text',
+          description: 'Read assumed path', dependsOn: [], input: { path: join(directory, 'missing.md') } }] }),
+      runPlannerReview: async input => {
+        observed.push({ status: input.outcome.status, completed: input.completedStepIds, safe: input.safeToReplay });
+        if (input.outcome.status === 'failure') {
+          expect(input.outcome.failure.reason).toBeTruthy();
+          return { action: 'replan', reason: 'The assumed source does not exist; use the actual source.',
+            plan: { status: 'ready', intent: 'read actual evidence', acceptanceCriteria: ['Read evidence'],
+              requiredCapabilities: [], steps: [{ id: 'actual-source', capabilityKey: 'filesystem.read_text',
+                description: 'Read actual path', dependsOn: [], input: { path: validPath } }] } };
+        }
+        return { action: 'continue', reason: 'Actual evidence was read.' };
+      },
+      runStepRepair: async () => { throw new Error('Local patch must not run'); },
+      runCorrection: async () => { throw new Error('Local correction must not run'); },
+      runImplementer: async () => { throw new Error('Use maintained reader'); },
+      runResponder: async input => String((input.results[0]?.output as { content?: string })?.content),
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+    };
+    const broker = new PermissionBroker(store, new DefaultHostOperationExecutor(), directory);
+    const task = await new TaskService(store, createAgentLoop(store, directory, agents, broker), broker)
+      .createAndWait({ message: 'Read the actual evidence', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    expect(task.result).toContain('actual evidence');
+    expect(observed.map(item => item.status)).toEqual(['failure', 'success']);
+    expect(observed[0]?.completed).toEqual([]);
+    expect(task.correctionState.roundsUsed).toBe(1);
+  });
+
+  it('sends an unusable evaluator decision to global planning before stopping', async () => {
+    let reviewed = 0;
+    const agents: AgentServices = {
+      runPlanner: async () => ({ status: 'ready', intent: 'count lines', acceptanceCriteria: ['Return two'],
+        requiredCapabilities: [], steps: [{ id: 'count', capabilityKey: 'text.count_lines',
+          description: 'Count lines', dependsOn: [], input: { text: 'a\nb' } }] }),
+      runPlannerReview: async input => {
+        reviewed += 1;
+        expect(input.outcome.status).toBe('failure');
+        return { action: 'block', reason: 'Evaluator requested approval without an operation to authorize.' };
+      },
+      runImplementer: async () => { throw new Error('Use builtin'); },
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'builtin', evaluatorRunId: 'review',
+        status: 'wait_approval', verdict: 'reject', score: 0, failures: [], recommendations: [], evidence: [] }),
+    };
+    const { service } = createService(agents);
+    const task = await service.createAndWait({ message: 'Count lines', attachments: [], permissionMode: 'full' });
+    expect(task.status).toBe('BLOCKED');
+    expect(reviewed).toBe(1);
   });
 
   it('repairs only failed arguments and keeps already completed steps', async () => {
@@ -299,6 +400,37 @@ describe('AgentLoop', () => {
     expect(readFileSync(join(directory, 'game.js'), 'utf8')).toContain('mines = 10');
     expect(criteriaSeen).toContainEqual(['Complete this step: Create the game page']);
     expect(criteriaSeen).toContainEqual(['Complete this step: Create game logic']);
+  });
+
+  it('generates an evidence-dependent report only after its source step completes', async () => {
+    let root = '';
+    let evidence: import('../../src/agents/agent-runner.js').FileImplementerInput['verifiedResults'];
+    const agents: AgentServices = {
+      runPlanner: async () => ({ status: 'ready', intent: 'summarize source into a file',
+        acceptanceCriteria: ['The report reflects the source'], requiredCapabilities: [], steps: [
+          { id: 'read', capabilityKey: 'filesystem.read_text', description: 'Read evidence', dependsOn: [],
+            input: { path: join(root, 'source.txt') } },
+          { id: 'report', capabilityKey: 'filesystem.write_text', description: 'Save the report', dependsOn: ['read'],
+            input: { path: join(root, 'report.md'), generation: { instruction: 'Summarize the observed source.' } } },
+        ] }),
+      runFileImplementer: async input => {
+        evidence = input.verifiedResults;
+        expect(readFileSync(join(root, 'source.txt'), 'utf8')).toBe('Observed fact: 42 jobs.');
+        expect(evidence?.[0]?.stepId).toBe('read');
+        return `Report: ${(evidence?.[0]?.output as { content?: string }).content}`;
+      },
+      runPlannerReview: async () => ({ action: 'continue', reason: 'The observed step matches its goal.' }),
+      runResponder: async () => 'Report saved from the observed source.',
+      runImplementer: async () => { throw new Error('Use maintained capabilities'); },
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+    };
+    const { service, directory } = createService(agents);
+    root = directory;
+    writeFileSync(join(root, 'source.txt'), 'Observed fact: 42 jobs.');
+    const task = await service.createAndWait({ message: 'Read source.txt and save a report.md', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    expect(readFileSync(join(root, 'report.md'), 'utf8')).toBe('Report: Observed fact: 42 jobs.');
   });
 
   it('keeps implemented file content stable across an approval pause', async () => {
@@ -663,6 +795,98 @@ describe('AgentLoop', () => {
     expect(resumed.status).toBe('COMPLETED');
     expect(resumed.correctionState.roundsUsed).toBe(1);
     expect(store.listEvents(task.id).filter(event => event.type === 'correction.round_finished')).toHaveLength(1);
+  });
+
+  it('reviews a checkpointed result after restart before completing the task', async () => {
+    const { store, directory } = createService();
+    let reviewCalls = 0;
+    const agents: AgentServices = {
+      runPlanner: async () => { throw new Error('The saved plan must be used'); },
+      runPlannerReview: async input => {
+        reviewCalls += 1;
+        expect(input.outcome).toEqual({ status: 'success', output: { count: 2 } });
+        expect(input.completedStepIds).toEqual(['count']);
+        return { action: 'continue', reason: 'The count is verified.' };
+      },
+      runImplementer: async () => { throw new Error('No tool generation expected'); },
+      runEvaluator: async () => { throw new Error('The completed operation must not execute again'); },
+    };
+    const task = store.createTask({ message: 'Count lines', attachments: [] });
+    const planner: PlannerDecision = { status: 'ready', intent: 'count lines', acceptanceCriteria: ['Two lines'],
+      requiredCapabilities: [], steps: [{ id: 'count', capabilityKey: 'text.count_lines',
+        description: 'Count lines', dependsOn: [], input: { text: 'a\nb' } }] };
+    task.status = 'EXECUTING';
+    task.executionCheckpoint = { planner, capabilityName: 'text.count_lines', capabilityVersion: '1.0.0',
+      stepBindings: [{ stepId: 'count', capabilityKey: 'text.count_lines', capabilityId: 'text.count_lines', version: '1.0.0' }],
+      completedStepIds: ['count'], stepResults: [{ stepId: 'count', output: { count: 2 }, observedAt: new Date().toISOString() }],
+      currentStepId: 'count', operationSequence: 0,
+      pendingReview: { stepId: 'count', outcome: 'success', output: { count: 2 }, safeToReplay: true } };
+    store.saveTask(task);
+    const broker = new PermissionBroker(store, new DefaultHostOperationExecutor(), directory);
+    const service = new TaskService(store, createAgentLoop(store, directory, agents, broker), broker);
+    expect(await service.resumeAfterRestart()).toBe(1);
+    expect(store.getTask(task.id)?.status).toBe('COMPLETED');
+    expect(reviewCalls).toBe(1);
+    expect(store.listEvents(task.id).filter(event => event.type === 'plan.reviewed')).toHaveLength(1);
+  });
+
+  it('resumes an interrupted pure built-in step without a host operation journal', async () => {
+    const agents: AgentServices = {
+      runPlanner: async () => { throw new Error('Use the saved plan'); },
+      runPlannerReview: async () => ({ action: 'continue', reason: 'The count matches the text.' }),
+      runImplementer: async () => { throw new Error('No tool generation expected'); },
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+    };
+    const { service, store } = createService(agents);
+    const task = store.createTask({ message: 'Count two lines', attachments: [] });
+    const planner: PlannerDecision = { status: 'ready', intent: 'count lines', acceptanceCriteria: ['Two lines'],
+      requiredCapabilities: [], steps: [{ id: 'count', capabilityKey: 'text.count_lines',
+        description: 'Count lines', dependsOn: [], input: { text: 'a\nb' } }] };
+    task.status = 'EVALUATING';
+    task.executionCheckpoint = { planner, capabilityName: 'text.count_lines', capabilityVersion: '1.0.0',
+      stepBindings: [{ stepId: 'count', capabilityKey: 'text.count_lines', capabilityId: 'text.count_lines', version: '1.0.0' }],
+      completedStepIds: [], stepResults: [], currentStepId: 'count', operationSequence: 0 };
+    store.saveTask(task);
+    expect(store.listRecoverableTaskIds()).toContain(task.id);
+    expect(await service.resumeAfterRestart()).toBe(1);
+    expect(store.getTask(task.id)?.status).toBe('COMPLETED');
+    expect(store.listEvents(task.id).filter(event => event.type === 'plan.reviewed')).toHaveLength(1);
+  });
+
+  it('requires read-only investigation when a failed host operation may have had side effects', async () => {
+    const { store, directory } = createService();
+    const firstPath = join(directory, 'first-folder');
+    const nextPath = join(directory, 'another-folder');
+    const agents: AgentServices = {
+      runPlanner: async () => { throw new Error('Use saved plan'); },
+      runPlannerReview: async input => {
+        expect(input.outcome.status).toBe('failure');
+        expect(input.safeToReplay).toBe(false);
+        return { action: 'replan', reason: 'Try a different write destination.',
+          plan: { status: 'ready', intent: 'create folder elsewhere', acceptanceCriteria: ['Folder exists'],
+            requiredCapabilities: [], steps: [{ id: 'different-write', capabilityKey: 'filesystem.mkdir',
+              description: 'Create another folder', dependsOn: [], input: { path: nextPath } }] } };
+      },
+      runImplementer: async () => { throw new Error('No tool generation expected'); },
+      runEvaluator: async () => { throw new Error('No operation should execute'); },
+    };
+    const task = store.createTask({ message: 'Create the requested folder', attachments: [] });
+    const planner: PlannerDecision = { status: 'ready', intent: 'create folder', acceptanceCriteria: ['Folder exists'],
+      requiredCapabilities: [], steps: [{ id: 'first-write', capabilityKey: 'filesystem.mkdir',
+        description: 'Create first folder', dependsOn: [], input: { path: firstPath } }] };
+    task.status = 'EXECUTING';
+    task.executionCheckpoint = { planner, capabilityName: 'filesystem.mkdir', capabilityVersion: '1.0.0',
+      stepBindings: [{ stepId: 'first-write', capabilityKey: 'filesystem.mkdir', capabilityId: 'filesystem.mkdir', version: '1.0.0' }],
+      completedStepIds: [], stepResults: [], currentStepId: 'first-write', operationSequence: 0,
+      pendingReview: { stepId: 'first-write', outcome: 'failure', safeToReplay: false,
+        failure: { stage: 'test', code: 'LIVE_TEST_FAILED', reason: 'The postcondition could not be verified.' } } };
+    store.saveTask(task);
+    const broker = new PermissionBroker(store, new DefaultHostOperationExecutor(), directory);
+    const service = new TaskService(store, createAgentLoop(store, directory, agents, broker), broker);
+    expect(await service.resumeAfterRestart()).toBe(1);
+    expect(store.getTask(task.id)?.status).toBe('BLOCKED');
+    expect(existsSync(nextPath)).toBe(false);
   });
 
   it('blocks restart of a corrected write step when its new operation identity has no journal result', async () => {

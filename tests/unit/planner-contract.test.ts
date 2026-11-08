@@ -2,6 +2,20 @@ import { describe, expect, it } from 'vitest';
 import { parsePlannerDecision } from '../../src/agents/planner-contract.js';
 
 describe('planner contract', () => {
+  it('requires three distinct clarification choices when choices are offered', () => {
+    const base = { status: 'needs_user_input', acceptanceCriteria: [], steps: [], inputRequest: {
+      taskId: 'weather', question: '哪个城市？', requiredFields: [{ name: 'city', reason: '需要城市', sensitive: false }],
+      resumeToken: 'resume', options: [{ label: '广州', value: '广州' }, { label: '深圳', value: '深圳' },
+        { label: '东莞', value: '东莞' }],
+    } };
+    expect(parsePlannerDecision(base).inputRequest?.options).toHaveLength(3);
+    expect(() => parsePlannerDecision({ ...base, inputRequest: { ...base.inputRequest,
+      options: base.inputRequest.options.slice(0, 2) } })).toThrow(/three distinct choices/);
+    expect(() => parsePlannerDecision({ ...base, inputRequest: { ...base.inputRequest,
+      options: [{ label: '广州', value: '广州' }, { label: '广州2', value: '广州' }, { label: '深圳', value: '深圳' }] } }))
+      .toThrow(/distinct values/);
+  });
+
   it('rejects reading a directory as text but permits reading a file inside it', () => {
     const folder = { id: 'folder', capabilityKey: 'filesystem.mkdir', description: 'Create directory',
       dependsOn: [], input: { path: 'D:\\Demo\\game' } };
@@ -22,6 +36,17 @@ describe('planner contract', () => {
       { ...step, input: { path: 'D:/demo/game.js' } },
     ] })).toThrow(/steps\[0\]\.input/);
   });
+  it('rejects a report body written before dependent observations are available', () => {
+    const fetch = { id: 'fetch', capabilityKey: 'network.request', description: 'Fetch source', dependsOn: [],
+      input: { url: 'https://example.org/data', method: 'GET' } };
+    const write = { id: 'report', capabilityKey: 'filesystem.write_text', description: 'Write report',
+      dependsOn: ['fetch'], input: { path: 'D:/demo/report.md', content: 'Prewritten findings' } };
+    expect(() => parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [fetch, write] }))
+      .toThrow(/static content.*generation\.instruction/);
+    expect(parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [fetch, {
+      ...write, input: { path: 'D:/demo/report.md', generation: { instruction: 'Summarize the fetched evidence.' } },
+    }] }).steps).toHaveLength(2);
+  });
   it('unwraps explicit typed values before launch input reaches a host call', () => {
     const plan = parsePlannerDecision({
       status: 'ready', acceptanceCriteria: [],
@@ -29,6 +54,33 @@ describe('planner contract', () => {
         input: { applicationName: { type: 'string', value: '网易云音乐' }, args: { type: 'array', value: [] } } }],
     });
     expect(plan.steps[0]?.input).toEqual({ applicationName: '网易云音乐', args: [] });
+  });
+
+  it('repairs only unambiguous planner argument shapes seen in failed tasks', () => {
+    const plan = parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [
+      { id: 'launch', capabilityKey: 'process.launch', description: 'Open app', dependsOn: [],
+        input: { applicationName: 'Demo', args: {} } },
+      { id: 'fetch', capabilityKey: 'network.request', description: 'Fetch data', dependsOn: ['launch'],
+        input: { url: 'https://example.org/data', method: 'GET', timeout: 5_000 } },
+      { id: 'write', capabilityKey: 'filesystem.write_text', description: 'Create file', dependsOn: ['fetch'],
+        input: { path: 'D:/demo/result.txt', generation: { instruction: 'A'.repeat(603) } } },
+    ] });
+    expect(plan.steps.map(step => step.input)).toEqual([
+      { applicationName: 'Demo', args: [] },
+      { url: 'https://example.org/data', method: 'GET' },
+      { path: 'D:/demo/result.txt', generation: { instruction: 'A'.repeat(603) } },
+    ]);
+  });
+
+  it('does not guess nonempty argument objects or accept unbounded file briefs', () => {
+    const launch = { id: 'launch', capabilityKey: 'process.launch', description: 'Open app', dependsOn: [],
+      input: { applicationName: 'Demo', args: { unknown: 'value' } } };
+    expect(() => parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [launch] }))
+      .toThrow(/steps\[0\]\.input\.args/);
+    const write = { id: 'write', capabilityKey: 'filesystem.write_text', description: 'Create file', dependsOn: [],
+      input: { path: 'D:/demo/result.txt', generation: { instruction: 'A'.repeat(2_001) } } };
+    expect(() => parsePlannerDecision({ status: 'ready', acceptanceCriteria: [], steps: [write] }))
+      .toThrow(/steps\[0\]\.input\.generation\.instruction/);
   });
 
   it('rejects an object element in process arguments with a field path', () => {

@@ -15,6 +15,7 @@ import { OpenAICompatibleProvider } from '../model/openai-compatible-provider.js
 import { OllamaProvider } from '../model/ollama-provider.js';
 import { AgentLoop } from './agent-loop.js';
 import { AgentController } from './agent-controller.js';
+import { RoleAgentRuntime } from './role-agent-runtime.js';
 import { BudgetManager } from './budget-manager.js';
 import { AdaptiveScheduler } from './scheduler.js';
 import { SessionService } from './session-service.js';
@@ -94,11 +95,18 @@ export function createDependencies(overrides: Partial<RuntimeConfig> = {}): Runt
         model: config.modelName,
         timeoutMs: config.modelRequestTimeoutMs,
       });
+  const a2aProtocol = new A2AProtocol(store);
+  const roleAgentRuntime = new RoleAgentRuntime(a2aProtocol);
   const gateway = new ModelGateway(modelProvider, {
     start: (request, details) => store.startModelTrace(request, details?.model ?? config.modelName, details),
     finish: (id, outcome) => store.finishModelTrace(id, outcome),
+  }, activity => {
+    store.appendEvent(activity.taskId, { type: 'agent.activity', payload: {
+      runId: activity.runId, role: activity.role, status: activity.status,
+      durationMs: activity.durationMs,
+    } });
+    roleAgentRuntime.onActivity(activity);
   });
-  const a2aProtocol = new A2AProtocol(store);
   const agentController = new AgentController(a2aProtocol);
   const agents = new AgentRunner(gateway, process.env.BRAVE_SEARCH_API_KEY?.trim()
     ? new BraveWebSearch(process.env.BRAVE_SEARCH_API_KEY.trim()) : undefined);
@@ -132,11 +140,13 @@ export function createDependencies(overrides: Partial<RuntimeConfig> = {}): Runt
     workspaceRoot,
     desktopDirectory: config.desktopDirectory,
     sessionMemory: sessionService,
+    cancelModelTask: taskId => gateway.cancelTask(taskId),
+    clearModelCancellation: taskId => gateway.clearTaskCancellation(taskId),
   });
 
   return {
     config, store, modelProvider,
-    taskService: new TaskService(store, loop, permissionBroker, sessionService),
+    taskService: new TaskService(store, loop, permissionBroker, sessionService, roleAgentRuntime),
     registry, sessionService, a2aProtocol, agentController,
   };
 }
