@@ -15,7 +15,7 @@ import type {
 import { SqliteStore } from '../storage/sqlite-store.js';
 import { PermissionPolicy } from './policy.js';
 import type { HostCall, HostCallResult, HostExecutionContext, HostOperationExecutor } from './operation-protocol.js';
-import { isShellGuiLaunch } from './process-contract.js';
+import { hasBoundedProcessArgs, isShellGuiLaunch } from './process-contract.js';
 
 export class ApprovalRequiredError extends Error {
   readonly code = 'APPROVAL_REQUIRED';
@@ -363,10 +363,9 @@ function assertOperationBounded(operation: PermissionOperation): void {
     if (launch && (!path.win32.isAbsolute(command) || path.win32.extname(command).toLowerCase() !== '.exe')) {
       throw new PermissionDeniedError('Application launch requires an absolute executable path.');
     }
-    if (!Array.isArray(args) || args.length > 20 || !args.every((item) => typeof item === 'string' && item.length <= 500)
-      || args.reduce<number>((total, item) => total + (item as string).length, 0) > 2_000
+    if (!hasBoundedProcessArgs(args, launch)
       || (cwd !== undefined && (typeof cwd !== 'string' || !cwd.trim() || cwd.length > 4_096))) {
-      throw new PermissionDeniedError('Process arguments or working directory exceed the approval display limit.');
+      throw new HostOperationError('INVALID_PROCESS_ARGUMENTS', 'Process arguments or working directory exceed the supported limits.');
     }
     if (!launch && isShellGuiLaunch(command, args)) {
       throw new PermissionDeniedError('GUI applications must use process.launch, not process.run.');

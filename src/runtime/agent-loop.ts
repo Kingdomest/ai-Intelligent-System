@@ -28,6 +28,7 @@ import { compactVerifiedResult } from '../agents/step-review-context.js';
 import type { DelegationOptions, TaskCollaborationRuntime } from './task-collaboration.js';
 import type { ToolDiscovery, ToolOption } from '../capabilities/tool-discovery.js';
 import { inspectGitDestination, routineGitClone } from './git-clone-contract.js';
+import { renderTaskResult, toolResultContent } from './task-result.js';
 
 export type AgentServices = Pick<AgentRunner, 'runPlanner' | 'runEvaluator' | 'runImplementer'>
   & Partial<Pick<AgentRunner, 'runResponder' | 'runCorrection' | 'runDraftCorrection' | 'runFileImplementer' | 'runStepRepair' | 'runPlannerReview' | 'runToolSearch' | 'runToolSelection'>>;
@@ -208,7 +209,7 @@ export class AgentLoop {
 
         if (planner.requiredCapabilities.length === 0 && planner.steps.every((step) => !step.capabilityKey)) {
           if (planner.steps.length === 0) {
-            task.result = '任务已完成：当前需求无需执行工具。';
+            task.result = renderTaskResult('COMPLETED', { summary: '当前需求无需执行工具。' });
             this.setStatus(task, 'COMPLETED');
             this.event(task, 'task.completed', { reason: 'no-work-required' });
             return task;
@@ -434,13 +435,15 @@ export class AgentLoop {
           .map(step => routineGitClone(step.input ?? {})).filter((item): item is NonNullable<typeof item> => item !== null);
         const existingSource = lastOutput && typeof lastOutput === 'object'
           ? lastOutput as { alreadyPresent?: unknown; source?: unknown } : {};
-        task.result = checkouts.length === 1 && existingSource.alreadyPresent === true
+        const checkoutSummary = checkouts.length === 1 && existingSource.alreadyPresent === true
           ? existingSource.source === 'github-source-archive'
             ? `目标目录 ${checkouts[0]!.directory} 已有该仓库源码归档；未重复克隆，目录不含 Git 历史。`
             : `目标目录 ${checkouts[0]!.directory} 已有对应的 Git 仓库；未重复克隆。`
           : checkouts.length === 1
             ? `已将仓库拉取到 ${checkouts[0]!.directory}。`
-          : formatResult(lastOutput);
+          : undefined;
+        task.result = renderTaskResult('COMPLETED', checkoutSummary
+          ? { summary: checkoutSummary } : toolResultContent(lastOutput));
       }
       this.finishActiveRound(task);
       task.executionCheckpoint = undefined;
@@ -449,7 +452,7 @@ export class AgentLoop {
       return task;
     } catch (error) {
       if (this.cancellationRequested.has(taskId)) {
-        task.result = '任务已停止，可发送新的任务。';
+        task.result = renderTaskResult('CANCELLED', { summary: '任务已停止，可发送新的任务。' });
         task.executionCheckpoint = undefined;
         task.pendingPermission = undefined;
         task.status = 'CANCELLED';
@@ -460,7 +463,7 @@ export class AgentLoop {
       }
       if (error instanceof ApprovalRequiredError || errorCode(error) === 'APPROVAL_REQUIRED') return this.dependencies.store.getTask(taskId) ?? task;
       if (error instanceof PermissionDeniedError || errorCode(error) === 'PERMISSION_DENIED') {
-        task.result = `任务已停止：${error instanceof Error ? error.message : '权限被拒绝。'}`;
+        task.result = renderTaskResult('CANCELLED', { summary: error instanceof Error ? error.message : '权限被拒绝。' });
         task.executionCheckpoint = undefined;
         this.setStatus(task, 'CANCELLED');
         this.event(task, 'task.cancelled', { reason: 'permission-denied' });
@@ -1057,6 +1060,7 @@ export class AgentLoop {
     const verifiedResult = (output: unknown) => ({ completed: true, output,
       verification: cachedHostOutcome ? compactStepVerification(cachedHostOutcome.report) : undefined });
     for (;;) {
+      let rejectedBeforeExecution = false;
       try {
         let verifiedMaintainedOperation = false;
         const checkpoint = task.executionCheckpoint;
@@ -1109,6 +1113,11 @@ export class AgentLoop {
               const value = await this.dependencies.permissionBroker.handle(task.id, permissionOperation, context);
               return { callId: call.callId, ok: true, value };
             } catch (error) {
+              // This evidence comes from the broker, not a generated tool's error.
+              // A rejected single-call builtin with no journal entry never ran.
+              rejectedBeforeExecution = capabilityName === 'process.run'
+                && error instanceof HostOperationError && error.code === 'INVALID_PROCESS_ARGUMENTS'
+                && this.dependencies.store.listStepOperations(task.id, context.stepId, capabilityVersion).length === 0;
               return {
                 callId: call.callId,
                 ok: false,
@@ -1325,16 +1334,16 @@ export class AgentLoop {
         latestFailure = error instanceof Error ? error.message : String(error);
         if (this.dependencies.agents.runPlannerReview) {
           throw new StepReviewRequiredError({ stage: 'execution',
-            code: error instanceof HostOperationError ? error.code : 'EXECUTION_ERROR',
+            code,
             reason: latestFailure, stepId: task.currentStepId,
-            capabilityId: capabilityName, version: capabilityVersion }, this.safeToRetry(task, capabilityVersion));
+            capabilityId: capabilityName, version: capabilityVersion }, rejectedBeforeExecution || this.safeToRetry(task, capabilityVersion));
         }
-        if (!this.safeToRetry(task, capabilityVersion)) {
+        if (!rejectedBeforeExecution && !this.safeToRetry(task, capabilityVersion)) {
           this.block(task, '宿主操作结果未通过验证，自动重放可能产生重复副作用。');
           return { completed: false };
         }
         const revised = await this.reviseStep(task, planner, input, capabilityName, capabilityVersion,
-          { stage: 'execution', code: error instanceof HostOperationError ? error.code : 'EXECUTION_ERROR',
+          { stage: 'execution', code,
             reason: latestFailure, stepId: task.currentStepId, capabilityId: capabilityName, version: capabilityVersion });
         if (!revised) return { completed: false };
         input = revised;
@@ -1487,7 +1496,7 @@ export class AgentLoop {
   }
 
   private block(task: TaskRun, message: string): TaskRun {
-    task.result = `任务已阻塞：${message}`;
+    task.result = renderTaskResult('BLOCKED', { summary: message });
     this.setStatus(task, 'BLOCKED');
     this.event(task, 'task.blocked', { reason: message });
     return task;
@@ -1512,7 +1521,7 @@ export class AgentLoop {
   }
 
   private fail(task: TaskRun, message: string): TaskRun {
-    task.result = `任务未完成：${message}`;
+    task.result = renderTaskResult('FAILED', { summary: message });
     task.executionCheckpoint = undefined;
     this.setStatus(task, 'FAILED');
     this.event(task, 'task.failed', { message });
@@ -1714,7 +1723,7 @@ export class TaskService {
         }
       }
       task.status = 'BLOCKED';
-      task.result = '任务已阻塞：服务重启时任务仍在处理中，且没有可安全续验的操作检查点。没有自动重放；请重新提交任务。';
+      task.result = renderTaskResult('BLOCKED', { summary: '服务重启时任务仍在处理中，且没有可安全续验的操作检查点。没有自动重放；请重新提交任务。' });
       task.updatedAt = new Date().toISOString();
       this.store.saveTask(task);
       this.store.appendEvent(taskId, { type: 'task.blocked', payload: { reason: 'interrupted without a safe checkpoint' } });
@@ -1842,7 +1851,7 @@ function isRoutineLookupAnswer(message: string, planner: PlannerDecision,
 
 function needsGroundedResponse(capabilityKey: string | undefined): boolean {
   return capabilityKey === 'network.request' || capabilityKey === 'filesystem.read_text'
-    || capabilityKey === 'presentation.create' || capabilityKey === 'mcp.call';
+    || capabilityKey === 'presentation.create' || capabilityKey === 'mcp.call' || capabilityKey === 'process.run';
 }
 
 function publicSourceUrl(value: string): string {
@@ -1859,17 +1868,6 @@ function compactStepVerification(report: TestReport): StepVerificationEvidence {
   return { mode: report.mode, passed: report.passed, failed: report.failed, blocked: report.blocked,
     checks: report.cases.slice(0, 10).map(item => ({ id: item.id, status: item.status,
       codes: item.codes.slice(0, 8) })) };
-}
-
-function formatResult(output: unknown): string {
-  if (output && typeof output === 'object' && 'count' in output) return `任务已完成：统计结果为 ${(output as { count: unknown }).count}`;
-  if (output && typeof output === 'object' && 'path' in output && typeof (output as { path?: unknown }).path === 'string') {
-    const value = output as { path: string; created?: boolean; removed?: boolean; bytesWritten?: number };
-    if (value.created) return `任务已完成：已创建目录 ${value.path}`;
-    if (value.removed) return `任务已完成：已删除 ${value.path}`;
-    if (typeof value.bytesWritten === 'number') return `任务已完成：已写入 ${value.bytesWritten} 字节到 ${value.path}`;
-  }
-  return `任务已完成：${JSON.stringify(output)}`;
 }
 
 function errorCode(error: unknown): string {

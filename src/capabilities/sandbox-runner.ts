@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { HostCall, HostCallResult, HostCallHandler } from '../permissions/operation-protocol.js';
-import { isShellGuiLaunch } from '../permissions/process-contract.js';
+import { hasBoundedProcessArgs, isShellGuiLaunch } from '../permissions/process-contract.js';
 import { presentationInputSchema } from '../presentations/render.js';
 
 export interface SandboxLimits {
@@ -300,8 +300,7 @@ function defaultDryRun(call: HostCall): HostCallResult {
     const launch = call.action === 'launch';
     const command = launch ? args.executable : args.command;
     const processArgs = args.args;
-    if (typeof command !== 'string' || !command.trim() || !Array.isArray(processArgs)
-      || processArgs.length > 100 || !processArgs.every((item) => typeof item === 'string')) {
+    if (typeof command !== 'string' || !command.trim() || !hasBoundedProcessArgs(processArgs, launch)) {
       return { callId: call.callId, ok: false, error: { code: 'INVALID_REQUEST', message: `host.process.${launch ? 'launch' : 'run'} expects a request object with a non-empty command and a bounded string args array.` } };
     }
     if (launch) return { callId: call.callId, ok: true, value: { started: true, pid: null } };

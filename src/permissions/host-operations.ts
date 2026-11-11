@@ -7,7 +7,7 @@ import path from 'node:path';
 import type { CapabilityPermission } from '../domain/contracts.js';
 import type { HostCall, HostCallResult, HostExecutionContext, HostOperationExecutor } from './operation-protocol.js';
 import { canonicalizeFilesystemPath } from './policy.js';
-import { isShellGuiLaunch } from './process-contract.js';
+import { hasBoundedProcessArgs, isShellGuiLaunch } from './process-contract.js';
 import { presentationInputSchema, writePresentation } from '../presentations/render.js';
 import type { McpService } from '../mcp/service.js';
 
@@ -229,7 +229,7 @@ export class DefaultHostOperationExecutor implements HostOperationExecutor {
     const cwd = typeof operation.arguments.cwd === 'string'
       ? resolveHostPath(operation.arguments.cwd, context.workspaceRoot)
       : context.workspaceRoot;
-    if (!command || !Array.isArray(args) || args.length > 100 || !args.every((item) => typeof item === 'string')) {
+    if (!command || !hasBoundedProcessArgs(args)) {
       throw Object.assign(new Error('Process operation must include a command and a bounded string argument list.'), { code: 'INVALID_REQUEST' });
     }
     if (isShellGuiLaunch(command, args)) {

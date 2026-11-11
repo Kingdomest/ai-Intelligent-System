@@ -35,7 +35,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
   describeRequest(request: ModelRequest): ModelRequestDetails {
     const url = new URL(`${this.config.baseUrl.replace(/\/+$/, '')}/chat/completions`);
     return { provider: 'openai-compatible', endpoint: `${url.origin}${url.pathname}`, model: this.config.model,
-      stream: false, temperature: 0, timeoutMs: this.timeoutFor(request), responseFormat: 'json-instructions' };
+      stream: false, temperature: 0, timeoutMs: this.timeoutFor(request),
+      responseFormat: request.outputSchema === undefined ? 'json-instructions' : 'json-schema-instructions' };
   }
 
   private timeoutFor(request: ModelRequest): number {
@@ -49,6 +50,13 @@ export class OpenAICompatibleProvider implements ModelProvider {
     const url = `${this.config.baseUrl.replace(/\/+$/, '')}/chat/completions`;
 
     try {
+      // Compatible endpoints do not all support native JSON Schema output.
+      // Always deliver the contract in the prompt; the gateway still validates it.
+      const system = request.outputSchema === undefined
+        ? `${request.system}\nReturn only valid JSON.`
+        : `${request.system}\nReturn only a JSON value matching the following JSON Schema. `
+          + `Use the exact field names and types, including all required nested fields. `
+          + `Return the value, not the schema, without Markdown or commentary.\nJSON Schema:\n${JSON.stringify(request.outputSchema)}`;
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -59,7 +67,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
           model: this.config.model,
           temperature: 0,
           messages: [
-            { role: 'system', content: `${request.system}\nReturn only valid JSON.` },
+            { role: 'system', content: system },
             { role: 'user', content: request.user },
           ],
         }),

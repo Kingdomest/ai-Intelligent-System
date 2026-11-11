@@ -71,6 +71,85 @@ afterEach(() => {
 });
 
 describe('AgentLoop', () => {
+  it('executes a file-size scan with an inline script longer than 500 characters', async () => {
+    const script = `
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const root = process.argv[1];
+      const files = [];
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith('.bin')) continue;
+        const fullPath = path.join(root, entry.name);
+        const metadata = fs.statSync(fullPath);
+        files.push({ path: fullPath, bytes: metadata.size });
+      }
+      files.sort((left, right) => right.bytes - left.bytes);
+      console.log(JSON.stringify({ largest: files[0], scanned: files.length }));
+    `;
+    expect(script.length).toBeGreaterThan(500);
+    const agents: AgentServices = {
+      runPlanner: async input => ({ status: 'ready', intent: 'find largest file',
+        acceptanceCriteria: ['Return the largest file path and byte count'], requiredCapabilities: [],
+        steps: [{ id: 'scan', capabilityKey: 'process.run', description: 'Scan the file sizes', dependsOn: [],
+          input: { command: process.execPath, args: ['-e', script, input.workspaceRoot!] } }] }),
+      runPlannerReview: async () => ({ action: 'continue', reason: 'File sizes were observed.' }),
+      runResponder: input => new AgentRunner(new ModelGateway({ complete: async request => {
+        const evidence = JSON.parse(request.user).results[0].output;
+        expect(evidence).not.toHaveProperty('stdout');
+        const largest = evidence.data.largest;
+        return { data: { summary: 'Found the largest file.', details: [
+          { label: '完整路径', value: largest.path }, { label: '字节数', value: String(largest.bytes) },
+        ], warnings: [], nextSteps: [] }, usage: { inputTokens: 1, outputTokens: 1 } };
+      } })).runResponder(input),
+      runImplementer: async () => { throw new Error('Use the builtin process tool.'); },
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+    };
+    const { service, store, directory } = createService(agents);
+    writeFileSync(join(directory, 'small.bin'), 'small');
+    writeFileSync(join(directory, 'largest.bin'), 'x'.repeat(2048));
+    const task = await service.createAndWait({ message: 'Find the largest file', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    const operation = store.listStepOperations(task.id, 'scan', '1.0.0')[0]!;
+    expect(operation.state).toBe('completed');
+    const result = operation.result as { value: { exitCode: number; stdout: string } };
+    expect(result.value.exitCode).toBe(0);
+    expect(JSON.parse(result.value.stdout)).toEqual({
+      largest: { path: join(directory, 'largest.bin'), bytes: 2048 }, scanned: 2,
+    });
+    expect(task.result).toContain('结果摘要：\nFound the largest file.');
+    expect(task.result).toContain(`完整路径：${join(directory, 'largest.bin')}`);
+    expect(task.result).not.toMatch(/stdout|stderr|exitCode/);
+  });
+
+  it('replans a process request rejected by the broker before execution without claiming uncertain side effects', async () => {
+    const reviews: boolean[] = [];
+    const agents: AgentServices = {
+      runPlanner: async () => ({ status: 'ready', intent: 'run a command', acceptanceCriteria: ['Output verified'],
+        requiredCapabilities: [], steps: [{ id: 'bad-cwd', capabilityKey: 'process.run', description: 'Run the command',
+          dependsOn: [], input: { command: process.execPath, args: ['-e', 'console.log("verified")'], cwd: 'x'.repeat(4097) } }] }),
+      runPlannerReview: async input => {
+        if (input.outcome.status === 'success') return { action: 'continue', reason: 'Output verified.' };
+        expect(input.outcome.failure.code).toBe('INVALID_PROCESS_ARGUMENTS');
+        reviews.push(input.safeToReplay);
+        return { action: 'replan', reason: 'Use the valid workspace directory.', plan: {
+          status: 'ready', intent: 'run a command', acceptanceCriteria: ['Output verified'], requiredCapabilities: [],
+          steps: [{ id: 'valid-cwd', capabilityKey: 'process.run', description: 'Run in the workspace', dependsOn: [],
+            input: { command: process.execPath, args: ['-e', 'console.log("verified")'], cwd: input.workspaceRoot } }],
+        } };
+      },
+      runImplementer: async () => { throw new Error('Use the builtin process tool.'); },
+      runEvaluator: async input => ({ targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+        status: 'pass', verdict: 'pass', score: 1, failures: [], recommendations: [], evidence: [] }),
+    };
+    const { service, store } = createService(agents);
+    const task = await service.createAndWait({ message: 'Run the command', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    expect(reviews).toEqual([true]);
+    expect(store.listStepOperations(task.id, 'bad-cwd', '1.0.0')).toHaveLength(0);
+    expect(store.listStepOperations(task.id, 'valid-cwd', '1.0.0')).toHaveLength(1);
+  });
+
   it('runs delegated steps with peer result requests and main Agent review', async () => {
     const reviewed: string[] = [];
     let reviewProtocol: A2AProtocol;
@@ -667,7 +746,7 @@ describe('AgentLoop', () => {
   it('converts twelve pasted Chinese slides into a real deck without a model-generated tool or JSON echo', async () => {
     const mock = new MockModelProvider();
     const runner = new AgentRunner(new ModelGateway({ complete: request => request.role === 'responder'
-      ? Promise.resolve({ data: { answer: '演示文稿已保存到桌面。' }, usage: { inputTokens: 1, outputTokens: 1 } })
+      ? Promise.resolve({ data: { summary: '演示文稿已保存到桌面。', details: [], warnings: [], nextSteps: [] }, usage: { inputTokens: 1, outputTokens: 1 } })
       : mock.complete(request) }));
     const { service, directory } = createService(runner);
     mkdirSync(join(directory, 'Desktop'));
@@ -688,7 +767,7 @@ describe('AgentLoop', () => {
   it('can turn a completed slide-writing task into a PPTX without asking for the same content again', async () => {
     const mock = new MockModelProvider();
     const runner = new AgentRunner(new ModelGateway({ complete: request => request.role === 'responder'
-      ? Promise.resolve({ data: { answer: '演示文稿已保存。' }, usage: { inputTokens: 1, outputTokens: 1 } })
+      ? Promise.resolve({ data: { summary: '演示文稿已保存。', details: [], warnings: [], nextSteps: [] }, usage: { inputTokens: 1, outputTokens: 1 } })
       : mock.complete(request) }));
     const { service, store, directory } = createService(runner);
     mkdirSync(join(directory, 'Desktop'));
@@ -1336,7 +1415,8 @@ describe('AgentLoop', () => {
         intent: 'weather', status: 'ready', acceptanceCriteria: ['用中文给出深圳当前气温及来源'], requiredCapabilities: [],
         steps: [{ id: 'weather', capabilityKey: 'network.request', description: 'Fetch Shenzhen current weather', dependsOn: [],
           input: { url: 'https://weather.example.test/current?city=Shenzhen', method: 'GET' } }],
-      } : request.role === 'responder' ? { answer: '深圳当前气温 27.9°C。来源：https://weather.example.test/current?city=Shenzhen' } : undefined;
+      } : request.role === 'responder' ? { summary: '深圳当前气温 27.9°C。来源：https://weather.example.test/current?city=Shenzhen',
+        details: [], warnings: [], nextSteps: [] } : undefined;
       if (request.role === 'implementer') throw new Error('Network results must not require a generated summary tool.');
       return data ? { data, usage: { inputTokens: 1, outputTokens: 1 } } : fallback.complete(request);
     } }));
@@ -1358,7 +1438,7 @@ describe('AgentLoop', () => {
         .resolveApproval(task.id, task.pendingPermission!.requestId, true);
     }
     expect(task.status, task.result).toBe('COMPLETED');
-    expect(task.result).toBe('深圳当前气温 27.9°C。来源：https://weather.example.test/current?city=Shenzhen');
+    expect(task.result).toContain('结果摘要：\n深圳当前气温 27.9°C。来源：https://weather.example.test/current?city=Shenzhen');
     expect(store.listEvents(task.id).find(event => event.type === 'answer.sources')?.payload.sources)
       .toEqual([{ title: 'weather.example.test', url: 'https://weather.example.test/current?city=Shenzhen' }]);
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -1385,7 +1465,7 @@ describe('AgentLoop', () => {
       if (request.role === 'planner' || request.role === 'planner.route') {
         throw new Error('A public news question must not become an ungrounded direct answer.');
       }
-      if (request.role === 'responder') return { data: { answer: '2026 年的尊界 V800 刹车踏板测试引发争议，报道日期为 10 月 13 日。' },
+      if (request.role === 'responder') return { data: { summary: '2026 年的尊界 V800 刹车踏板测试引发争议，报道日期为 10 月 13 日。', details: [], warnings: [], nextSteps: [] },
         usage: { inputTokens: 1, outputTokens: 1 } };
       return fallback.complete(request);
     } }));
@@ -2060,7 +2140,7 @@ describe('AgentLoop', () => {
     const result = await resumedService.resolveApproval(task.id, task.pendingPermission!.requestId, true);
     expect(result.status).toBe('COMPLETED');
     expect(store.getActive('create_folder')).toBeNull();
-    expect(result.result).toBe(`任务已完成：已创建目录 ${join(realpathSync.native(directory), 'hm')}`);
+    expect(result.result).toContain(`结果摘要：\n已创建目录 ${join(realpathSync.native(directory), 'hm')}`);
     expect(existsSync(join(directory, 'hm'))).toBe(true);
     expect(store.listEvents(task.id).some((event) => event.type === 'task.permission_approved')).toBe(true);
     store.close();

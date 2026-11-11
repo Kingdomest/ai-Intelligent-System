@@ -35,6 +35,7 @@ import type {
 } from '../domain/contracts.js';
 import { estimateTokens } from '../runtime/session-memory.js';
 import { finishCorrection } from '../runtime/correction-round.js';
+import { renderTaskResult } from '../runtime/task-result.js';
 import { persistableCorrectionFailure } from '../runtime/correction-router.js';
 import type { ModelCompletion, ModelRequest, ModelRequestDetails } from '../model/gateway.js';
 
@@ -818,7 +819,7 @@ export class SqliteStore {
         task.pendingPermission = undefined;
         task.executionCheckpoint = undefined;
         task.status = 'CANCELLED';
-        task.result = `任务已停止：你拒绝了操作“${record.operation.action}”（${record.operation.target}），该操作未执行。`;
+        task.result = renderTaskResult('CANCELLED', { summary: `你拒绝了操作“${record.operation.action}”（${record.operation.target}），该操作未执行。` });
         task.updatedAt = new Date().toISOString();
         this.saveTask(task);
         this.appendEvent(taskId, { type: 'task.cancelled', payload: { reason: 'permission-denied', operationId: record.operationId } });
@@ -932,7 +933,7 @@ export class SqliteStore {
         task.pendingPermission = undefined;
         task.executionCheckpoint = undefined;
         task.status = 'BLOCKED';
-        task.result = '任务已阻塞：服务重启前操作已开始，但结果无法确认。为避免重复副作用，贾维斯没有重放该操作；请检查目标后重新提交任务。';
+        task.result = renderTaskResult('BLOCKED', { summary: '服务重启前操作已开始，但结果无法确认。为避免重复副作用，贾维斯没有重放该操作；请检查目标后重新提交任务。' });
         task.updatedAt = new Date().toISOString();
         this.saveTask(task);
         this.appendEvent(item.task_id, {

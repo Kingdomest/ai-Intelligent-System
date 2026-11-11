@@ -67,6 +67,40 @@ afterEach(() => {
 });
 
 describe('PermissionBroker', () => {
+  it.each(['request', 'full'] as const)('keeps complete inline scripts and the permission gate in %s mode', async mode => {
+    const { directory, store } = createStore();
+    const task = setupTask(store, mode);
+    const executor: HostOperationExecutor = { execute: vi.fn(async call => ({
+      callId: call.callId, ok: true, value: { exitCode: 0, stdout: '{}', stderr: '' },
+    })) };
+    const broker = new PermissionBroker(store, executor, directory);
+    const script = 'Write-Output ' + JSON.stringify('x'.repeat(700));
+    const call: PermissionOperation = { ...operation(task.id), permission: 'process', action: 'run',
+      target: 'powershell', arguments: { command: 'powershell', args: ['-NoProfile', '-Command', script] } };
+    const execution = { ...context(task.id, mode, directory), capabilityPermissions: ['process' as const] };
+    if (mode === 'request') {
+      await expect(broker.handle(task.id, call, execution)).rejects.toBeInstanceOf(ApprovalRequiredError);
+      expect(store.getTask(task.id)?.pendingPermission?.operation.arguments.args).toEqual(call.arguments.args);
+      expect(executor.execute).not.toHaveBeenCalled();
+    } else {
+      await expect(broker.handle(task.id, call, execution)).resolves.toMatchObject({ exitCode: 0 });
+      expect(executor.execute).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('rejects excessive process arguments before creating a journal entry or calling the host', async () => {
+    const { directory, store } = createStore();
+    const task = setupTask(store, 'full');
+    const executor: HostOperationExecutor = { execute: vi.fn() };
+    const broker = new PermissionBroker(store, executor, directory);
+    const call: PermissionOperation = { ...operation(task.id), permission: 'process', action: 'run',
+      target: 'powershell', arguments: { command: 'powershell', args: ['x'.repeat(16_001)] } };
+    await expect(broker.handle(task.id, call, { ...context(task.id, 'full', directory), capabilityPermissions: ['process'] }))
+      .rejects.toMatchObject({ code: 'INVALID_PROCESS_ARGUMENTS' });
+    expect(store.getOperation(task.id, call.operationId)).toBeNull();
+    expect(executor.execute).not.toHaveBeenCalled();
+  });
+
   it('requests approval for an exact application launch and denial makes zero host calls', async () => {
     const { directory, store } = createStore();
     const task = setupTask(store, 'request');

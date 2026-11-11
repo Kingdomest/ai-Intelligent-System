@@ -1,5 +1,6 @@
 import type { ModelCompletion, ModelProvider, ModelRequest, ModelRequestDetails } from './gateway.js';
 import type { TestPlan } from '../agents/test-agent.js';
+import { toolResultContent } from '../runtime/task-result.js';
 
 export class MockModelProvider implements ModelProvider {
   public calls = 0;
@@ -8,6 +9,10 @@ export class MockModelProvider implements ModelProvider {
 
   async complete(request: ModelRequest): Promise<ModelCompletion> {
     this.calls += 1;
+    if (request.role === 'responder') {
+      const input = JSON.parse(request.user) as { results: Array<{ output: unknown }> };
+      return this.completion(toolResultContent(input.results.at(-1)?.output));
+    }
     if (/^task-worker-\d+\.tool_search$/.test(request.role)) {
       return this.completion({ queries: ['count lines text'] });
     }
