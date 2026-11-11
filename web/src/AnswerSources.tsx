@@ -1,24 +1,11 @@
-export interface AnswerSource {
-  title: string;
-  url: string;
-}
+import { sanitizeAnswerSources, type AnswerSource } from '../../src/domain/answer-sources.js';
+export type { AnswerSource } from '../../src/domain/answer-sources.js';
 
 export function sourcesFromTaskEvents(events: Array<{ type: string; payload: Record<string, unknown> }>): AnswerSource[] {
-  const seen = new Set<string>();
-  return events.flatMap(event => {
+  return sanitizeAnswerSources(events.flatMap(event => {
     if (event.type !== 'research.searched' && event.type !== 'answer.sources') return [];
     return Array.isArray(event.payload.sources) ? event.payload.sources : [];
-  }).flatMap((item): AnswerSource[] => {
-    if (!item || typeof item !== 'object') return [];
-    const source = item as Record<string, unknown>;
-    if (typeof source.url !== 'string' || typeof source.title !== 'string') return [];
-    try {
-      const url = new URL(source.url);
-      if (url.protocol !== 'https:' || url.username || url.password || seen.has(url.toString())) return [];
-      seen.add(url.toString());
-      return [{ title: source.title, url: url.toString() }];
-    } catch { return []; }
-  }).slice(0, 20);
+  }));
 }
 
 export function AnswerSources({ sources }: { sources: AnswerSource[] }) {

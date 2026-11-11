@@ -38,6 +38,22 @@ afterEach(async () => {
 });
 
 describe('DefaultHostOperationExecutor', () => {
+  it('reads normal article pages above 100 KB while retaining a bounded network response limit', async () => {
+    const html = `<html><body>${'article '.repeat(40_000)}</body></html>`;
+    const executor = new DefaultHostOperationExecutor({ fetch: vi.fn(async () => new Response(html)) });
+    const request = call({ permission: 'network', action: 'request', target: 'https://example.test/article',
+      arguments: { method: 'GET' } });
+    const context = executionContext(await workspace(), 'full', false, ['network']);
+    const result = await executor.execute(request, context);
+    expect(result).toMatchObject({ ok: true, value: { status: 200, body: html } });
+    const excessive = new DefaultHostOperationExecutor({ fetch: vi.fn(async () => new Response('x'.repeat(1_000_001))) });
+    await expect(excessive.execute(request, context)).resolves.toMatchObject({
+      ok: false, error: { message: expect.stringContaining('exceeds the configured limit') },
+    });
+    const custom = new DefaultHostOperationExecutor({ maxNetworkResponseBytes: 100, fetch: vi.fn(async () => new Response(html)) });
+    await expect(custom.execute(request, context)).resolves.toMatchObject({ ok: false });
+  });
+
   it.skipIf(process.platform !== 'win32')('stops a timed-out process and its descendant on Windows', async () => {
     const root = await workspace();
     const pidFile = join(root, 'descendant.pid');
@@ -188,7 +204,7 @@ describe('DefaultHostOperationExecutor', () => {
     }), executionContext(await workspace(), 'auto', false, ['network']));
 
     expect(result).toMatchObject({ ok: true, value: { status: 200, body: 'pinned response' } });
-    expect(autoGet).toHaveBeenCalledWith(new URL('https://example.test/public'), '93.184.216.34', expect.any(AbortSignal), 100_000, {});
+    expect(autoGet).toHaveBeenCalledWith(new URL('https://example.test/public'), '93.184.216.34', expect.any(AbortSignal), 1_000_000, {});
     expect(fetch).not.toHaveBeenCalled();
   });
 

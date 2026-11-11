@@ -603,6 +603,34 @@ describe('AgentRunner', () => {
       .rejects.toThrow(/too large|exceeds|过大|超过/i);
     expect(modelCalls).toBe(0);
   });
+
+  it('shares the final-answer budget across a short diagnostic and a long complete article', async () => {
+    const article = 'Article body\n' + 'text '.repeat(7_800) + '\nTHE_FINAL_CONCLUSION';
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      const evidence = JSON.parse(request.user).results;
+      expect(evidence[1].output.body).toBe(article);
+      return { data: { summary: 'A complete article summary.', details: [], warnings: [], nextSteps: [] },
+        usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const result = await runner.runResponder({ taskId: 'article', message: 'Summarize the complete article',
+      acceptanceCriteria: [], results: [
+        { stepId: 'head', observedAt: 'now', output: { status: 200, body: '' } },
+        { stepId: 'article', observedAt: 'now', output: { status: 200, body: article } },
+      ] });
+    expect(result).toContain('A complete article summary.');
+  });
+
+  it('restricts final-answer correction to local answer changes without authorizing tool replay', async () => {
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      expect((request.outputSchema as any).properties.action.enum).toEqual(['revise_answer', 'ask_user', 'block']);
+      expect(request.system).toContain('without repeating any operation');
+      return { data: { action: 'revise_answer', reason: 'Include the verified conclusion.' },
+        usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    await expect(runner.runCorrection({ taskId: 'article', request: 'Summarize', scope: 'answer', safeToReplay: false,
+      failure: { stage: 'answer', code: 'MISSING_CONCLUSION', reason: 'The conclusion was omitted.' } }))
+      .resolves.toMatchObject({ action: 'revise_answer' });
+  });
   it('constrains generated step identifiers in the schema sent to the model', async () => {
     let schema: unknown;
     const provider: ModelProvider = { complete: async (request) => {

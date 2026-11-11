@@ -1,5 +1,8 @@
 import type { StepReviewInput } from './agent-runner.js';
 
+// Final synthesis needs the source, not the short previews used for step review.
+export const ANSWER_RESULT_BUDGET = 48_000;
+
 const limited = (value: string, max: number): string => value.length <= max
   ? value : `${value.slice(0, max)}… [${value.length} characters total]`;
 
@@ -22,8 +25,8 @@ function readableBody(value: string): string {
 export function compactVerifiedResult(value: unknown, maxText = 8_000): unknown {
   if (typeof value === 'string') {
     const readable = isMarkup(value) ? readableBody(value) : value;
-    if (value.length <= maxText) return readable;
-    return { characters: value.length, excerpt: limited(readable, maxText), truncated: true };
+    if (readable.length <= maxText) return readable;
+    return { characters: readable.length, excerpt: limited(readable, maxText), truncated: true };
   }
   if (value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.slice(0, 20).map(item => compactVerifiedResult(item, maxText));

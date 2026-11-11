@@ -71,6 +71,54 @@ afterEach(() => {
 });
 
 describe('AgentLoop', () => {
+  it('summarizes the end of a long fetched article and corrects the answer without fetching again', async () => {
+    const article = '# Article\n' + 'Main text '.repeat(3_800) + '\nFINAL_CONCLUSION: delivery guarantees.';
+    const { store, directory } = createService();
+    let answers = 0;
+    const runner = new AgentRunner(new ModelGateway({ complete: async request => {
+      if (request.role === 'planner.correction') {
+        expect(JSON.parse(request.user).scope).toBe('answer');
+        expect((request.outputSchema as any).properties.action.enum).not.toContain('revise_plan_or_input');
+        return { data: { action: 'revise_answer', reason: 'Include the conclusion from the saved evidence.' },
+          usage: { inputTokens: 1, outputTokens: 1 } };
+      }
+      const results = JSON.parse(request.user).results;
+      expect(results[1].output.body).toBe(article);
+      answers++;
+      return { data: { summary: answers === 1 ? 'Introduction only.' : 'Full summary: delivery guarantees.',
+        details: [], warnings: [], nextSteps: [] }, usage: { inputTokens: 1, outputTokens: 1 } };
+    } }));
+    const agents: AgentServices = {
+      runPlanner: async () => ({ status: 'ready', intent: 'read article', acceptanceCriteria: ['Include the conclusion'],
+        requiredCapabilities: [], steps: [
+          { id: 'head', capabilityKey: 'network.request', description: 'Inspect response headers', dependsOn: [],
+            input: { url: 'https://example.test/article', method: 'HEAD' } },
+          { id: 'article', capabilityKey: 'network.request', description: 'Read the complete article', dependsOn: ['head'],
+            input: { url: 'https://example.test/article', method: 'GET' } },
+        ] }),
+      runPlannerReview: async () => ({ action: 'continue', reason: 'Read succeeded.' }),
+      runResponder: input => runner.runResponder(input),
+      runCorrection: input => runner.runCorrection(input),
+      runImplementer: async () => { throw new Error('Use the network builtin.'); },
+      runEvaluator: async input => {
+        const missing = input.target === 'task-answer' && !(input.output as { answer: string }).answer.includes('delivery guarantees');
+        return { targetId: input.target, targetVersion: 'candidate', evaluatorRunId: 'review',
+          status: missing ? 'retry' : 'pass', verdict: missing ? 'revise' : 'pass', score: missing ? 0.5 : 1,
+          failures: missing ? [{ code: 'MISSING_CONCLUSION', message: 'Include the final conclusion.' }] : [],
+          recommendations: [], evidence: [] };
+      },
+    };
+    const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => new Response(init?.method === 'HEAD' ? null : article));
+    const broker = new PermissionBroker(store, new DefaultHostOperationExecutor({ fetch }), directory);
+    const service = new TaskService(store, createAgentLoop(store, directory, agents, broker), broker);
+    const task = await service.createAndWait({ message: 'Read this article and summarize all sections', attachments: [], permissionMode: 'full' });
+    expect(task.status, task.result).toBe('COMPLETED');
+    expect(task.result).toContain('Full summary: delivery guarantees.');
+    expect(answers).toBe(2);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(store.listStepOperations(task.id, 'article', '1.0.0')).toHaveLength(1);
+  });
+
   it('executes a file-size scan with an inline script longer than 500 characters', async () => {
     const script = `
       const fs = require('node:fs');

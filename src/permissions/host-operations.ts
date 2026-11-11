@@ -21,6 +21,7 @@ export interface HostOperationAdapters {
   maxReadBytes?: number;
   maxWriteBytes?: number;
   maxNetworkBodyBytes?: number;
+  maxNetworkResponseBytes?: number;
   maxOutputBytes?: number;
   timeoutMs?: number;
   mcp?: McpService;
@@ -204,7 +205,7 @@ export class DefaultHostOperationExecutor implements HostOperationExecutor {
         }
         pinnedAddress = addresses[0].address;
       }
-      const maxOutputBytes = this.adapters.maxOutputBytes ?? 100_000;
+      const maxOutputBytes = this.adapters.maxNetworkResponseBytes ?? this.adapters.maxOutputBytes ?? 1_000_000;
       if (automaticRequest && pinnedAddress) {
         return await (this.adapters.autoGet ?? requestPinnedHttps)(parsedUrl, pinnedAddress, controller.signal, maxOutputBytes, headers);
       }

@@ -24,7 +24,7 @@ import { sanitizeAnswerSources } from './answer-sources.js';
 import { isNewsSearchUrl, parseNewsRss } from '../research/news-rss.js';
 import type { SessionMemorySnapshot } from '../domain/contracts.js';
 import { parsePlannerDecision, validateStepInput } from '../agents/planner-contract.js';
-import { compactVerifiedResult } from '../agents/step-review-context.js';
+import { ANSWER_RESULT_BUDGET, compactVerifiedResult } from '../agents/step-review-context.js';
 import type { DelegationOptions, TaskCollaborationRuntime } from './task-collaboration.js';
 import type { ToolDiscovery, ToolOption } from '../capabilities/tool-discovery.js';
 import { inspectGitDestination, routineGitClone } from './git-clone-contract.js';
@@ -418,7 +418,7 @@ export class AgentLoop {
             });
             return { ...result, output: { status: response.status, ok: response.ok, articles } };
           }
-          return { ...result, output: compactVerifiedResult(result.output),
+          return { ...result, output: compactVerifiedResult(result.output, ANSWER_RESULT_BUDGET),
             sourceUrl: step?.capabilityKey === 'network.request' && typeof step.input?.url === 'string'
               ? publicSourceUrl(step.input.url) : undefined };
         });
@@ -658,8 +658,10 @@ export class AgentLoop {
         answer = await this.dependencies.agents.runResponder!({ taskId: task.id,
           message: task.message, acceptanceCriteria: planner.acceptanceCriteria, results,
           feedback: resumedAnswerFailure, sessionMemory });
-      } catch {
-        return this.block(task, '回答 Agent 当前不可用，已验证的步骤结果仍保留。');
+      } catch (error) {
+        const reason = sanitizeCorrectionFailure({ stage: 'answer', code: 'ANSWER_UNAVAILABLE',
+          reason: error instanceof Error ? error.message : '回答 Agent 当前不可用' }).reason;
+        return this.block(task, `回答 Agent 未能生成结果：${reason}；已验证的步骤结果仍保留。`);
       }
     }
     // Conversational answers involve no tool calls and no external facts, so the
@@ -763,13 +765,14 @@ export class AgentLoop {
       try {
         proposed = this.dependencies.agents.runCorrection
           ? await this.dependencies.agents.runCorrection({ taskId: task.id, request: task.message,
-            failure, safeToReplay: false })
+            failure, safeToReplay: false, scope: 'answer' })
           : { action: 'revise_answer', reason: failure.reason };
       } catch {
         return this.block(task, `主 Agent 当前无法决定回答修正方向：${failure.reason}`);
       }
       const decision = routeCorrection(proposed, { confirmedToolDefect: false, safeToReplay: false });
-      if (decision.action !== 'revise_answer') return this.block(task, `无法安全修正回答：${decision.reason}`);
+      if (decision.action !== 'revise_answer') return this.block(task,
+        `最终回答仍缺少足够证据或需要补充信息：${failure.reason}。${decision.reason}`);
       task.correctionState = beginCorrection(task.correctionState, 'answer', randomUUID());
       this.setStatus(task, 'RETRYING');
       this.event(task, 'correction.round_started', { ordinal: task.correctionState.currentRound!.ordinal, target: 'answer' });
@@ -1855,13 +1858,7 @@ function needsGroundedResponse(capabilityKey: string | undefined): boolean {
 }
 
 function publicSourceUrl(value: string): string {
-  const url = new URL(value);
-  url.username = '';
-  url.password = '';
-  for (const key of [...url.searchParams.keys()]) {
-    if (/key|token|secret|password|signature|authorization/i.test(key)) url.searchParams.delete(key);
-  }
-  return url.toString();
+  return sanitizeAnswerSources([{ url: value }])[0]?.url ?? '';
 }
 
 function compactStepVerification(report: TestReport): StepVerificationEvidence {

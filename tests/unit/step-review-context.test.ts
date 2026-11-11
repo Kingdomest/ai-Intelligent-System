@@ -1,7 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { buildStepReviewContext, compactVerifiedResult } from '../../src/agents/step-review-context.js';
+import { ANSWER_RESULT_BUDGET, buildStepReviewContext, compactVerifiedResult } from '../../src/agents/step-review-context.js';
 
 describe('verified evidence context', () => {
+  it('preserves the end of a long article for final synthesis while keeping step previews short', () => {
+    const article = 'Introduction\n' + 'article text\n'.repeat(3_000) + '\nFinal section: packet structure and conclusion.';
+    const preview = compactVerifiedResult({ body: article }) as { body: { truncated: boolean } };
+    expect(preview.body.truncated).toBe(true);
+    const answer = compactVerifiedResult({ body: article }, ANSWER_RESULT_BUDGET);
+    expect(answer).toEqual({ body: article });
+  });
+
+  it('does not mark complete readable content as truncated just because scripts were large', () => {
+    const html = `<html><script>${'tracking();'.repeat(30_000)}</script><h1>Article</h1><p>Complete conclusion.</p></html>`;
+    const result = compactVerifiedResult({ body: html }) as { body: string };
+    expect(typeof result.body).toBe('string');
+    expect(result.body).toContain('Complete conclusion.');
+    expect(result.body).not.toContain('tracking');
+  });
+
   it('bounds a large HTML response while preserving its status and an explicit truncation marker', () => {
     const output = compactVerifiedResult({ status: 200, ok: true,
       headers: { 'content-type': 'text/html', 'set-cookie': 'secret' },
