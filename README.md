@@ -19,6 +19,26 @@ TypeScript · React · Fastify · SQLite · MCP
 
 当前工作子 Agent 共享同一执行循环，按步骤依赖推进。
 
+## 界面预览
+
+### 任务执行流程图
+
+展开任务流程，一眼查看主 Agent 的分派、各步骤进度、验收标准与依赖关系。
+
+![任务执行流程图：展示主 Agent、任务子 Agent 及步骤依赖](docs/images/task-flow-map.png)
+
+### 会话日志
+
+按会话搜索与筛选执行记录，查看错误、警告和任务事件，支持复制与下载。
+
+![会话日志：搜索、级别筛选与日志导出](docs/images/session-text-log.png)
+
+### 模型调用轨迹
+
+沿时间线查看模型请求与工具操作，统计调用次数、耗时和 token 用量，定位执行细节。
+
+![调用轨迹：模型调用、工具操作与执行事件时间线](docs/images/execution-trace.png)
+
 ## 可以这样使用
 
 ```text
@@ -73,25 +93,6 @@ npm run dev:web
 ```
 
 打开 **http://127.0.0.1:5173**，新建会话即可开始。后端默认运行在 `http://127.0.0.1:3000`。
-
-## 更多界面
-
-<details>
-<summary>查看任务流程、调用轨迹与会话日志</summary>
-
-**任务流程**：查看目标、验收标准、步骤分工及依赖关系。
-
-![任务执行流程图](docs/images/task-flow-map.png)
-
-**调用轨迹**：检查模型请求、工具操作、耗时与 token 用量。
-
-![调用轨迹](docs/images/execution-trace.png)
-
-**会话日志**：搜索、筛选和导出执行记录，定位失败环节。
-
-![会话文本日志](docs/images/session-text-log.png)
-
-</details>
 
 ## 开发与扩展
 
